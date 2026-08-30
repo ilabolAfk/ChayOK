@@ -1,7 +1,6 @@
 # Readme.md  
 <img width="839" height="485" alt="image" src="https://github.com/user-attachments/assets/325fdbcd-0b95-4ce1-9bd4-445d5fc41522" />
 
-#ChayOK — открытый голосовой помощник с экраном  
   
 **ChayOK** — это полностью автономный голосовой помощник с сенсорным экраном, работающий на Raspberry Pi.    
 Всё локально: распознавание речи (Vosk), генерация ответов (Ollama + Qwen2.5), синтез голоса (Piper TTS, голос "Денис"), интерфейс на Pygame.  
