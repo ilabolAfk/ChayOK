@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ЧайОК — голосовой помощник
-Edge TTS (онлайн) + Piper (офлайн fallback)
+ЧайОК — финальная версия
+Потоковая генерация, озвучка по предложениям, Руслан, нормальная погода
 """
 
 import os
@@ -13,14 +13,12 @@ import subprocess
 import tempfile
 import re
 import datetime
-import asyncio
 import tkinter as tk
 from tkinter import scrolledtext
 
 import vosk
 import pygame
 import requests
-import edge_tts
 
 try:
     import smbus2
@@ -42,22 +40,20 @@ VOSK_MODEL_PATH = os.path.join(BASE_DIR, "ChayOK/vosk-model")
 PIPER_PATH = os.path.join(BASE_DIR, "piper/piper")
 PIPER_MODEL = os.path.join(BASE_DIR, "piper/ru_RU-ruslan-medium.onnx")
 
-# --- Edge TTS (онлайн) ---
-EDGE_VOICE = "ru-RU-DmitryNeural"  # Мужской голос Microsoft (качественный)
-
-# --- LLM ---
-SERVER_OLLAMA_URL = "http://192.168.1.108:11434/api/chat"
+# --- LLM (Сервер + Fallback) ---
+SERVER_OLLAMA_URL = "http://192.168.1.108:11434/api/chat"  # IP твоего ПК
 SERVER_OLLAMA_MODEL = "qwen2.5:7b-instruct"
+
 LOCAL_OLLAMA_URL = "http://localhost:11434/api/chat"
 LOCAL_OLLAMA_MODEL = "qwen2.5:0.5b-instruct"
 
 WEATHER_API_KEY = "ТВОЙ_КЛЮЧ_СЮДА"
 CITY = "Moscow"
 
+# Аудиоустройства (жестко из теста arecord -l и aplay -l)
 AUDIO_RATE = 44100
 AUDIO_CHANNELS = 1
 AUDIO_CHUNK = 1024
-
 MIC_CARD = 3
 MIC_DEVICE = 0
 SPK_CARD = 4
@@ -75,10 +71,18 @@ audio_lock = threading.Lock()
 # ========================================
 
 COLORS = {
-    "bg": (10, 12, 20), "primary": (0, 180, 255), "secondary": (0, 220, 180),
-    "accent": (255, 200, 50), "salad": (120, 255, 120), "text": (200, 210, 230),
-    "text_dim": (100, 120, 150), "card_bg": (20, 30, 45), "border": (0, 150, 200),
-    "error": (255, 100, 100), "button": (0, 120, 200), "button_hover": (0, 150, 240),
+    "bg": (10, 12, 20),
+    "primary": (0, 180, 255),
+    "secondary": (0, 220, 180),
+    "accent": (255, 200, 50),
+    "salad": (120, 255, 120),
+    "text": (200, 210, 230),
+    "text_dim": (100, 120, 150),
+    "card_bg": (20, 30, 45),
+    "border": (0, 150, 200),
+    "error": (255, 100, 100),
+    "button": (0, 120, 200),
+    "button_hover": (0, 150, 240),
 }
 
 # ========================================
@@ -270,16 +274,10 @@ def get_weather_forecast(city=CITY, days=7):
     except Exception as e: return {"Ошибка": str(e)}
 
 # ========================================
-# ОЗВУЧКА (Edge TTS + Piper fallback)
+# ОЗВУЧКА
 # ========================================
 
-async def _edge_tts_generate(text, output_file):
-    """Асинхронно генерирует аудио через Edge TTS."""
-    communicate = edge_tts.Communicate(text, EDGE_VOICE)
-    await communicate.save(output_file)
-
-def speak_piper_fallback(text):
-    """Офлайн-озвучка через Piper (Руслан)."""
+def speak_piper(text):
     if not text or not os.path.exists(PIPER_PATH): return
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -289,35 +287,8 @@ def speak_piper_fallback(text):
         with audio_lock:
             subprocess.run(f'pw-play {temp_file}', shell=True, timeout=60)
         os.unlink(temp_file)
-        print("[TTS] Piper (офлайн)")
-    except Exception as e:
-        print(f"Ошибка Piper: {e}")
-
-def speak_hybrid(text):
-    """Пробует Edge TTS, если не выходит — Piper."""
-    if not text: return
-
-    # Пытаемся использовать Edge TTS (онлайн)
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            temp_file = f.name
-        
-        # Запускаем асинхронную генерацию
-        asyncio.run(_edge_tts_generate(text, temp_file))
-        
-        # Если файл создан и не пустой — играем
-        if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-            with audio_lock:
-                subprocess.run(f'pw-play {temp_file}', shell=True, timeout=60)
-            os.unlink(temp_file)
-            print("[TTS] Edge (онлайн)")
-            return
-    except Exception as e:
-        print(f"[TTS] Edge недоступен: {e}")
-
-    # Если Edge упал — откатываемся на Piper
-    print("[TTS] Переключаюсь на Piper...")
-    speak_piper_fallback(text)
+    except Exception as e: 
+        print(f"Ошибка озвучки: {e}")
 
 # ========================================
 # LLM (Потоковая генерация)
@@ -368,17 +339,16 @@ def ask_llm_streaming(command, ui_ref):
                 token = chunk["message"]["content"]
                 full_text += token
                 sentence_buffer += token
-                
                 ui_ref.response = full_text
 
                 if any(p in token for p in ['.', '!', '?', '\n']) and len(sentence_buffer.strip()) > 5:
                     clean_sentence = sentence_buffer.strip()
-                    threading.Thread(target=speak_hybrid, args=(clean_sentence,), daemon=True).start()
+                    threading.Thread(target=speak_piper, args=(clean_sentence,), daemon=True).start()
                     sentence_buffer = ""
         except Exception: pass
 
     if sentence_buffer.strip():
-        threading.Thread(target=speak_hybrid, args=(sentence_buffer.strip(),), daemon=True).start()
+        threading.Thread(target=speak_piper, args=(sentence_buffer.strip(),), daemon=True).start()
 
     ui_ref.status = "Ready"
     is_generating = False
@@ -569,7 +539,7 @@ class ChayOKUI:
                     elif btn["command"] == "__shutdown__":
                         self.response = "Выключаю..."
                         self.update_display()
-                        speak_hybrid("Выключаю")
+                        speak_piper("Выключаю")
                         time.sleep(2)
                         subprocess.run(["sudo", "shutdown", "-h", "now"])
                         pygame.quit()
@@ -591,7 +561,7 @@ class ChayOKUI:
             self.status = "Response:"
             self.weather_data = weather
             self.update_display()
-            threading.Thread(target=speak_hybrid, args=(response,), daemon=True).start()
+            threading.Thread(target=speak_piper, args=(response,), daemon=True).start()
         else:
             self.weather_data = None
             threading.Thread(target=ask_llm_streaming, args=(command, self), daemon=True).start()
