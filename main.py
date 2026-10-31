@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ЧайОК — финальная версия
-Потоковая генерация, озвучка по предложениям, Руслан, нормальная погода
+Потоковая генерация, анекдоты, радио с экраном выбора
 """
 
 import os
@@ -11,7 +11,6 @@ import time
 import threading
 import subprocess
 import tempfile
-import re
 import datetime
 import tkinter as tk
 from tkinter import scrolledtext
@@ -27,6 +26,7 @@ except ImportError:
     HAS_SMBUS = False
 
 import alarm
+import addition
 
 # ========================================
 # НАСТРОЙКИ
@@ -50,13 +50,15 @@ LOCAL_OLLAMA_MODEL = "qwen2.5:0.5b-instruct"
 WEATHER_API_KEY = "ТВОЙ_КЛЮЧ_СЮДА"
 CITY = "Moscow"
 
-# Аудиоустройства (жестко из теста arecord -l и aplay -l)
 AUDIO_RATE = 44100
 AUDIO_CHANNELS = 1
 AUDIO_CHUNK = 1024
-MIC_CARD = 3
+
+# --- УСТРОЙСТВА ---
+# Если микрофон и колонка на одной карте (card 1), то:
+MIC_CARD = 1
 MIC_DEVICE = 0
-SPK_CARD = 4
+SPK_CARD = 1
 SPK_DEVICE = 0
 
 SCREEN_WIDTH = 800
@@ -100,14 +102,14 @@ try:
     font_text = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf", 24)
     font_small = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf", 18)
     font_tiny = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf", 14)
-    font_button = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-Medium.ttf", 18)
+    font_button = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-Medium.ttf", 16) # Чуть меньше для 7 кнопок
 except:
     font_title = pygame.font.Font(None, 52)
     font_status = pygame.font.Font(None, 38)
     font_text = pygame.font.Font(None, 24)
     font_small = pygame.font.Font(None, 18)
     font_tiny = pygame.font.Font(None, 14)
-    font_button = pygame.font.Font(None, 18)
+    font_button = pygame.font.Font(None, 16)
 
 # ========================================
 # ВСПОМОГАТЕЛЬНЫЕ
@@ -154,7 +156,7 @@ def get_battery_level():
     except Exception: return None
 
 # ========================================
-# РЕДАКТОРЫ
+# РЕДАКТОРЫ И ОКНА
 # ========================================
 
 def open_script_editor():
@@ -227,6 +229,71 @@ def open_alarm_editor():
     tk.Button(btn_frame, text="Закрыть", command=root.destroy, bg="lightcoral", font=("Arial", 11), width=12).pack(side=tk.LEFT, padx=5)
     status_label = tk.Label(root, text="", font=("Arial", 10))
     status_label.pack()
+    root.mainloop()
+
+def open_radio_editor():
+    """Окно выбора радиостанции с ручным вводом частоты/названия."""
+    def play_selected(station):
+        result = addition.play_radio(station)
+        status_label.config(text=result)
+        root.after(1500, root.destroy) # Закрываем окно через 1.5 сек
+
+    def play_from_input():
+        value = entry_var.get().strip()
+        if not value:
+            status_label.config(text="Введи частоту или название станции.")
+            return
+        play_selected(value)
+
+    def stop_current():
+        result = addition.stop_radio()
+        status_label.config(text=result)
+
+    def refresh_stations(event=None):
+        # Обновляем список кнопок по фильтру из поля ввода.
+        query = entry_var.get().strip().lower()
+        for w in buttons_frame.winfo_children():
+            w.destroy()
+        stations = addition.list_stations()
+        if query:
+            shown = [s for s in stations if query in s.lower()]
+        else:
+            shown = stations
+        if not shown:
+            tk.Label(buttons_frame, text="(нет подходящих станций)", font=("Arial", 11),
+                     fg="gray").pack(pady=5)
+        for s in shown:
+            tk.Button(buttons_frame, text=s.upper(), font=("Arial", 11), width=28,
+                      command=lambda st=s: play_selected(st)).pack(pady=3)
+
+    root = tk.Tk()
+    root.title("Радио ЧайОК")
+    root.geometry("380x520")
+
+    tk.Label(root, text="Введи частоту или название:", font=("Arial", 12, "bold")).pack(pady=(12, 2))
+
+    entry_var = tk.StringVar()
+    entry_var.trace_add("write", refresh_stations)
+    entry = tk.Entry(root, textvariable=entry_var, font=("Arial", 14), justify="center")
+    entry.pack(fill=tk.X, padx=20, pady=6)
+    entry.focus_set()
+
+    tk.Button(root, text="Включить", font=("Arial", 12, "bold"), width=25,
+              command=play_from_input).pack(pady=6)
+
+    buttons_frame = tk.Frame(root)
+    buttons_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+    refresh_stations()
+
+    tk.Button(root, text="ОСТАНОВИТЬ", font=("Arial", 12, "bold"), fg="red", width=25,
+              command=stop_current).pack(pady=5)
+    tk.Button(root, text="Закрыть", font=("Arial", 12), width=25,
+              command=root.destroy).pack(pady=5)
+
+    status_label = tk.Label(root, text="", font=("Arial", 10), fg="blue")
+    status_label.pack(pady=8)
+
     root.mainloop()
 
 # ========================================
@@ -379,9 +446,16 @@ def process_command(command):
     alarm_response = alarm.process_alarm_command(command)
     if alarm_response: return alarm_response, None
 
+    addition_response = addition.process_addition_command(command)
+    if addition_response: return addition_response, None
+
     if "редактор" in command or "скрипт" in command:
         threading.Thread(target=open_script_editor, daemon=True).start()
         return "Открываю редактор.", None
+
+    if "радио" in command:
+        threading.Thread(target=open_radio_editor, daemon=True).start()
+        return "Открываю радио.", None
 
     for cmd in custom_commands:
         if cmd.lower() in command: return f"Выполнено: {cmd}", None
@@ -492,9 +566,18 @@ class ChayOKUI:
         self.voice = None
 
     def setup_buttons(self):
-        btn_w, btn_h, spacing = 105, 45, 8
+        # Уменьшили ширину, чтобы влезло 7 кнопок
+        btn_w, btn_h, spacing = 95, 45, 6
         y = SCREEN_HEIGHT - 100
-        button_defs = [("Привет", "привет"), ("Погода", "погода"), ("Прогноз", "прогноз на неделю"), ("Будильник", "__alarm_editor__"), ("Редактор", "редактор"), ("Выключить", "__shutdown__")]
+        button_defs = [
+            ("Привет", "привет"), 
+            ("Погода", "погода"), 
+            ("Прогноз", "прогноз на неделю"), 
+            ("Будильник", "__alarm_editor__"), 
+            ("Радио", "__radio_editor__"),  # Новая кнопка
+            ("Редактор", "редактор"), 
+            ("Выкл", "__shutdown__")
+        ]
         total_w = len(button_defs) * (btn_w + spacing) - spacing
         start_x = (SCREEN_WIDTH - total_w) // 2
         self.buttons = []
@@ -536,6 +619,9 @@ class ChayOKUI:
                     if btn["command"] == "__alarm_editor__":
                         threading.Thread(target=open_alarm_editor, daemon=True).start()
                         self.response = "Открываю редактор будильника."
+                    elif btn["command"] == "__radio_editor__":
+                        threading.Thread(target=open_radio_editor, daemon=True).start()
+                        self.response = "Открываю радио."
                     elif btn["command"] == "__shutdown__":
                         self.response = "Выключаю..."
                         self.update_display()

@@ -1,0 +1,6 @@
+# ChayOK — зависимости Python
+vosk==0.3.45
+pyaudio==0.2.14
+pygame==2.6.1
+requests==2.32.3
+smbus2==0.4.3
