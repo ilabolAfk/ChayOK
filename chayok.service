@@ -14,7 +14,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/bin/bash /home/pi/ChayOK/start_all.sh
-Restart=on-failure
+Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal

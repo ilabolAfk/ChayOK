@@ -44,58 +44,51 @@ import radio as radio_mod
 import timer as timer_mod
 import volume
 import watchdog
+import config
+import webpanel
 
 # ========================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ (читаются из config.json)
 # ========================================
 
-WAKE_WORDS = ["чайок", "чаек", "чаёк", "чай ок"]
-COMMAND_SILENCE = 2.5
-HISTORY_LIMIT = 4        # сколько последних реплик держать в контексте
-FOLLOWUP_SECONDS = 5     # окно продолжения без слова-активатора
+WAKE_WORDS = config.get("voice_input", "wake_words", default=["чайок"])
+COMMAND_SILENCE = float(config.get("voice_input", "command_silence", default=2.5))
+HISTORY_LIMIT = int(config.get("llm", "history_limit", default=4))
+FOLLOWUP_SECONDS = float(config.get("voice_input", "followup_seconds", default=5))
 
 BASE_DIR = "/home/pi"
 PROJECT_DIR = os.path.join(BASE_DIR, "ChayOK")
 SOUNDS_DIR = os.path.join(PROJECT_DIR, "sounds")
 
 VOSK_MODEL_PATH = os.path.join(PROJECT_DIR, "vosk-model")
-PIPER_PATH = os.path.join(BASE_DIR, "piper/piper")
-PIPER_MODEL = os.path.join(BASE_DIR, "piper/ru_RU-ruslan-medium.onnx")
+PIPER_PATH = config.get("voice", "piper", default=os.path.join(BASE_DIR, "piper/piper"))
+PIPER_MODEL = config.get("voice", "model",
+                         default=os.path.join(BASE_DIR, "piper/ru_RU-ruslan-medium.onnx"))
+PIPER_LENGTH_SCALE = str(config.get("voice", "length_scale", default=1.05))
+PIPER_SENTENCE_SILENCE = str(config.get("voice", "sentence_silence", default=0.35))
 
-# --- LLM: сначала локальный Bonsai (llama.cpp), потом сервер на ПК ---
-LLM_PROVIDERS = [
-    {
-        "kind": "completion",
-        "url": "http://127.0.0.1:8080/completion",
-        "name": "Bonsai (Pi, llama.cpp)",
-        "max_tokens": 160,
-    },
-    {
-        "kind": "ollama",
-        "url": "http://192.168.1.108:11434/api/chat",
-        "model": "qwen2.5:7b-instruct",
-        "name": "Сервер (ПК)",
-        "max_tokens": 220,
-    },
-]
-LLM_TIMEOUT = (5, 180)
-LLM_SYSTEM_PROMPT = (
-    "Ты — ЧайОК, голосовой помощник в маленьком устройстве. "
-    "Отвечай по-русски, кратко: одно-два предложения, без списков и разметки. "
-    "Никогда не пиши даты в формате ГГГГ-ММ-ДД — называй дату словами."
-)
+# --- LLM: список провайдеров по порядку, первый доступный и отвечает ---
+LLM_PROVIDERS = config.get("llm", "providers", default=[{
+    "kind": "completion",
+    "url": "http://127.0.0.1:8080/completion",
+    "name": "Bonsai (Pi, llama.cpp)",
+    "max_tokens": 160,
+}])
+LLM_TIMEOUT = (int(config.get("llm", "timeout_connect", default=5)),
+               int(config.get("llm", "timeout_read", default=180)))
+LLM_SYSTEM_PROMPT = config.get("llm", "system_prompt", default="Ты — ЧайОК.")
 
-CITY = "Москва"
+CITY = config.get("weather", "city", default="Москва")
 
-AUDIO_RATE = 16000        # Vosk обучен на 16 кГц
-AUDIO_CHANNELS = 1
-AUDIO_CHUNK = 4000        # ~125 мс при 16 кГц / 16 бит
+AUDIO_RATE = int(config.get("audio", "rate", default=16000))   # Vosk обучен на 16 кГц
+AUDIO_CHANNELS = int(config.get("audio", "channels", default=1))
+AUDIO_CHUNK = int(config.get("audio", "chunk", default=4000))
 
-MIC_DEVICE = os.environ.get("CHAYOK_MIC", "")   # пусто = определить автоматически
-SPK_DEVICE = os.environ.get("CHAYOK_SPK", "")   # пусто = определить автоматически
+MIC_DEVICE = os.environ.get("CHAYOK_MIC") or config.get("audio", "mic_device", default="")
+SPK_DEVICE = os.environ.get("CHAYOK_SPK") or config.get("audio", "spk_device", default="")
 
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 480
+SCREEN_WIDTH = int(config.get("screen", "width", default=800))
+SCREEN_HEIGHT = int(config.get("screen", "height", default=480))
 
 alarm_pending = None
 is_generating = False
@@ -518,7 +511,11 @@ def open_alarm_editor():
 
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
-CITY_COORDS = {"latitude": 55.7558, "longitude": 37.6173}
+CITY_COORDS = {
+    "latitude": float(config.get("weather", "latitude", default=55.7558)),
+    "longitude": float(config.get("weather", "longitude", default=37.6173)),
+}
+WEATHER_TZ = config.get("weather", "timezone", default="Europe/Moscow")
 
 # коды WMO → по-русски
 WMO_RU = {
@@ -544,7 +541,7 @@ def weather_desc(code):
 
 def _weather_request(daily=None, days=1):
     """Open-Meteo: ключ не нужен, HTTPS. OpenWeather из РФ висит на TLS."""
-    params = dict(CITY_COORDS, timezone="Europe/Moscow", forecast_days=days)
+    params = dict(CITY_COORDS, timezone=WEATHER_TZ, forecast_days=days)
     params["current"] = ("temperature_2m,apparent_temperature,"
                          "relative_humidity_2m,wind_speed_10m,weather_code")
     if daily:
@@ -726,7 +723,8 @@ def speak_piper_sync(text):
         # текст уходит в stdin, а не в shell — кавычки и $() безопасны
         res = subprocess.run(
             [PIPER_PATH, "--model", PIPER_MODEL, "--output_file", temp_file,
-             "--length_scale", "1.05", "--sentence_silence", "0.35"],
+             "--length_scale", PIPER_LENGTH_SCALE,
+             "--sentence_silence", PIPER_SENTENCE_SILENCE],
             input=text.encode("utf-8"),
             capture_output=True,
             timeout=120,
@@ -1619,6 +1617,24 @@ class ChayOKUI:
 ui = None
 
 
+def panel_status():
+    """Что показывает веб-панель в шапке."""
+    return {
+        "app_status": ui.status if ui else "запуск",
+        "response": (ui.response if ui else "")[:300],
+        "llm_alive": watchdog.is_alive(),
+    }
+
+
+def restart_app():
+    """Перезапуск на месте: тот же процесс, новый код и конфиг."""
+    def run():
+        time.sleep(0.8)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def install_crash_hook():
     """Необработанное исключение — письмо, а не тихая смерть."""
     def hook(exc_type, exc, tb):
@@ -1673,6 +1689,7 @@ def main():
         key="start",
     )
     watchdog.start()
+    webpanel.start(status_provider=panel_status, restart_callback=restart_app)
 
     ui = ChayOKUI()
     ui.update_display()

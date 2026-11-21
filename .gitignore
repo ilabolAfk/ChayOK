@@ -21,5 +21,6 @@ sounds/*.mp3
 # секреты и локальное состояние
 api.txt
 notify.json
+config.json
 alarm.json
 volume.json

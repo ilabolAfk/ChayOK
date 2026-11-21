@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 
+import config
 import volume
 
 BASE_DIR = "/home/pi/ChayOK"
@@ -26,7 +27,7 @@ DEFAULT_STATIONS = [
     {"name": "DFM", "url": "https://dfm.hostingradio.ru/dfm96.aacp"},
 ]
 
-DUCK_FACTOR = 0.2  # на сколько приглушать, пока ждём команду
+DUCK_FACTOR = float(config.get("radio", "duck_factor", default=0.2))
 
 
 def load_stations():

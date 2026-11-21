@@ -28,6 +28,12 @@ systemctl daemon-reload
 echo "Включаю автозапуск при загрузке..."
 systemctl enable chayok.service
 
+if pgrep -f 'python -u main.py' > /dev/null 2>&1; then
+  echo "Останавливаю экземпляр, запущенный вручную..."
+  pkill -f 'python -u main.py' || true
+  sleep 3
+fi
+
 echo "Перезапускаю службу..."
 systemctl restart chayok.service
 
