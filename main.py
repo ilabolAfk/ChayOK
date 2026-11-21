@@ -17,7 +17,6 @@ import tempfile
 import threading
 import time
 import traceback
-import wave
 from array import array
 
 import pygame
@@ -698,53 +697,6 @@ def speak_piper(text):
     _speech_queue.put(text)
 
 
-CUES = {
-    "cue-wake.wav": (880, 0.09, 0.45),
-    "cue-click.wav": (1320, 0.05, 0.35),
-    "cue-error.wav": (320, 0.22, 0.40),
-}
-
-
-def _write_tone(path, frequency, duration, amplitude):
-    """Короткий тон с плавными краями — без щелчков."""
-    rate = 22050
-    frames = max(1, int(rate * duration))
-    fade = max(1, frames // 8)
-    data = bytearray()
-    for index in range(frames):
-        if index < fade:
-            env = index / fade
-        elif index > frames - fade:
-            env = (frames - index) / fade
-        else:
-            env = 1.0
-        value = int(amplitude * env * 32767 * math.sin(2 * math.pi * frequency * index / rate))
-        data += int(value).to_bytes(2, "little", signed=True)
-    with wave.open(path, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(rate)
-        wav.writeframes(bytes(data))
-
-
-def ensure_cue_sounds():
-    os.makedirs(SOUNDS_DIR, exist_ok=True)
-    for name, (frequency, duration, amplitude) in CUES.items():
-        path = os.path.join(SOUNDS_DIR, name)
-        if os.path.exists(path):
-            continue
-        try:
-            _write_tone(path, frequency, duration, amplitude)
-        except Exception as e:
-            print("не смог создать звук", name, e)
-
-
-def cue(name):
-    path = os.path.join(SOUNDS_DIR, name)
-    if os.path.exists(path):
-        threading.Thread(target=play_wav, args=(path, 0.55), daemon=True).start()
-
-
 def speech_text(text):
     """Готовит текст для Piper: символы, на которых он запинается."""
 
@@ -966,7 +918,6 @@ def ask_llm_streaming(command, ui_ref):
             del dialogue_history[:-HISTORY_LIMIT * 2]
         else:
             ui_ref.response = "Ошибка: нейросеть недоступна."
-            cue("cue-error.wav")
             speak_piper("Извините, нейросеть недоступна.")
             dialogue_history.pop()
     except Exception as e:
@@ -1471,7 +1422,6 @@ class ChayOKUI:
     def handle_click(self, pos):
         global is_generating
         if self.timer_active and self.alarm_stop_rect and self.alarm_stop_rect.collidepoint(pos):
-            cue("cue-click.wav")
             timer_mod.stop()
             self.timer_active = False
             self.show_buttons = True
@@ -1490,7 +1440,6 @@ class ChayOKUI:
         if not self.alarm_active and not is_generating:
             for btn in self.buttons:
                 if btn["rect"].collidepoint(pos):
-                    cue("cue-click.wav")
                     if btn["command"] == "__alarm_editor__":
                         threading.Thread(target=open_alarm_editor, daemon=True).start()
                         self.response = "Открываю редактор будильника."
@@ -1711,7 +1660,6 @@ def main():
     install_signal_handlers()
     os.makedirs(PROJECT_DIR, exist_ok=True)
     os.makedirs(os.path.join(PROJECT_DIR, "sounds"), exist_ok=True)
-    ensure_cue_sounds()
     custom_commands = load_custom_commands()
     if not os.path.exists(commands_path()):
         save_custom_commands(["включи свет", "выключи свет"])
@@ -1773,7 +1721,6 @@ def main():
                 if command:
                     ui.execute_command(command)
                 elif not ui.timer_active and voice.is_wake_detected():
-                    cue("cue-wake.wav")
                     ui.update_status("Listening...", "Говорите...")
 
             if not ui.alarm_active and not ui.timer_active:
