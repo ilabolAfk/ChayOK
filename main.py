@@ -697,9 +697,14 @@ def speak_piper(text):
 
 def speech_text(text):
     """Готовит текст для Piper: символы, на которых он запинается."""
+
+    def percent_to_words(match):
+        value = int(match.group(1))
+        return f"{value} {_plural(value, 'процент', 'процента', 'процентов')}"
+
     text = text.replace("м/с", "метров в секунду")
     text = text.replace("км/ч", "километров в час")
-    text = text.replace("%", " процентов")
+    text = re.sub(r"(\d+)\s*%", percent_to_words, text)
     text = text.replace("°C", " градусов").replace("°", " градусов")
     text = re.sub(r"(\d)\s*\.\s*(\d)", r"\1,\2", text)        # 3.8 → 3,8
     text = re.sub(r"(?<![\w-])-\s*(\d)", r"минус \1", text)   # -4 → минус 4
