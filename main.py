@@ -6,6 +6,7 @@
 
 import datetime
 import json
+import math
 import os
 import queue
 import re
@@ -210,6 +211,97 @@ def draw_rounded_rect(surface, color, rect, radius=6, border_width=0, border_col
 def draw_glow_line(surface, color, start, end, width=2):
     pygame.draw.line(surface, (color[0] // 2, color[1] // 2, color[2] // 2), start, end, width + 4)
     pygame.draw.line(surface, color, start, end, width)
+
+
+# ========================================
+# ИКОНКИ ПОГОДЫ (векторно, без картинок)
+# ========================================
+
+ICON_SUN = (255, 205, 60)
+ICON_CLOUD = (232, 238, 248)
+ICON_CLOUD_DARK = (198, 210, 228)
+ICON_RAIN = (120, 195, 255)
+ICON_SNOW = (225, 245, 255)
+ICON_BOLT = (255, 210, 70)
+
+
+def weather_icon_kind(code):
+    code = int(code)
+    if code in (0, 1):
+        return "sun"
+    if code == 2:
+        return "partly"
+    if code == 3:
+        return "cloud"
+    if code in (45, 48):
+        return "fog"
+    if 51 <= code <= 67 or 80 <= code <= 82:
+        return "rain"
+    if 71 <= code <= 77 or code in (85, 86):
+        return "snow"
+    if code >= 95:
+        return "thunder"
+    return "cloud"
+
+
+def _icon_sun(surface, center, radius):
+    pygame.draw.circle(surface, ICON_SUN, center, radius)
+    for angle in range(0, 360, 45):
+        rad = math.radians(angle)
+        start = (center[0] + math.cos(rad) * (radius + 4), center[1] + math.sin(rad) * (radius + 4))
+        end = (center[0] + math.cos(rad) * (radius + 9), center[1] + math.sin(rad) * (radius + 9))
+        pygame.draw.line(surface, ICON_SUN, start, end, 2)
+
+
+def _icon_cloud(surface, x, y, width, color=ICON_CLOUD):
+    pygame.draw.circle(surface, color, (int(x + width * 0.30), int(y + width * 0.34)), int(width * 0.21))
+    pygame.draw.circle(surface, color, (int(x + width * 0.54), int(y + width * 0.25)), int(width * 0.26))
+    pygame.draw.circle(surface, color, (int(x + width * 0.76), int(y + width * 0.37)), int(width * 0.18))
+    pygame.draw.rect(surface, color,
+                     (int(x + width * 0.16), int(y + width * 0.35),
+                      int(width * 0.68), int(width * 0.26)),
+                     border_radius=int(width * 0.12))
+
+
+def draw_weather_icon(surface, kind, rect):
+    x, y, w, h = rect
+    if kind == "sun":
+        _icon_sun(surface, (x + w // 2, y + h // 2), max(4, int(w * 0.20)))
+    elif kind == "partly":
+        _icon_sun(surface, (x + int(w * 0.30), y + int(h * 0.28)), max(3, int(w * 0.12)))
+        _icon_cloud(surface, x + int(w * 0.18), y + int(h * 0.34), int(w * 0.78))
+    elif kind == "fog":
+        for index, dy in enumerate((0.30, 0.48, 0.66)):
+            width = int(w * (0.80 if index != 1 else 0.62))
+            pygame.draw.rect(surface, ICON_CLOUD, (x + 2, y + int(h * dy), width, 5), border_radius=3)
+    elif kind == "rain":
+        _icon_cloud(surface, x, y, w)
+        for index in range(3):
+            sx = x + int(w * (0.36 + index * 0.14))
+            pygame.draw.line(surface, ICON_RAIN, (sx, y + int(h * 0.70)),
+                             (sx - 4, y + int(h * 0.90)), 3)
+    elif kind == "snow":
+        _icon_cloud(surface, x, y, w)
+        for index in range(3):
+            cx = x + int(w * (0.34 + index * 0.16))
+            cy = y + int(h * 0.82)
+            for angle in (0, 60, 120):
+                rad = math.radians(angle)
+                dx, dy = math.cos(rad) * 5, math.sin(rad) * 5
+                pygame.draw.line(surface, ICON_SNOW, (cx - dx, cy - dy), (cx + dx, cy + dy), 2)
+    elif kind == "thunder":
+        _icon_cloud(surface, x, y, int(w * 0.9), ICON_CLOUD_DARK)
+        bolt = [
+            (x + int(w * 0.52), y + int(h * 0.52)),
+            (x + int(w * 0.38), y + int(h * 0.80)),
+            (x + int(w * 0.49), y + int(h * 0.80)),
+            (x + int(w * 0.42), y + int(h * 0.99)),
+            (x + int(w * 0.64), y + int(h * 0.68)),
+            (x + int(w * 0.52), y + int(h * 0.68)),
+        ]
+        pygame.draw.polygon(surface, ICON_BOLT, bolt)
+    else:
+        _icon_cloud(surface, x, y, w)
 
 
 def commands_path():
@@ -424,6 +516,7 @@ def get_weather_now():
         feels = round(current["apparent_temperature"])
         wind = round(current["wind_speed_10m"] / 3.6, 1)  # км/ч → м/с
         return {
+            "_code": current["weather_code"],
             "Температура": f"{temperature} {_plural(temperature, 'градус', 'градуса', 'градусов')}",
             "Ощущается": f"{feels} {_plural(feels, 'градус', 'градуса', 'градусов')}",
             "Погода": weather_desc(current["weather_code"]),
@@ -1338,11 +1431,24 @@ class ChayOKUI:
 
         if self.weather_data and "Ошибка" not in self.weather_data:
             wx, wy = SCREEN_WIDTH - 280, 150
-            draw_rounded_rect(screen, COLORS["salad"], (wx, wy, 250, 190), radius=8)
-            y_offset = wy + 8
-            for k, v in list(self.weather_data.items())[:7]:
-                screen.blit(font_tiny.render(f"{k}: {v}", True, (0, 0, 60)), (wx + 10, y_offset))
-                y_offset += 24
+            panel = pygame.Rect(wx, wy, 250, 190)
+            draw_rounded_rect(screen, COLORS["card_bg"], panel, radius=8)
+            pygame.draw.rect(screen, COLORS["secondary"], panel, 1, border_radius=8)
+
+            icon_kind = weather_icon_kind(self.weather_data.get("_code", 3))
+            draw_weather_icon(screen, icon_kind, pygame.Rect(wx + 10, wy + 10, 64, 64))
+
+            header = font_tiny.render(str(self.weather_data.get("Погода", "")).capitalize(),
+                                      True, COLORS["text"])
+            screen.blit(header, (wx + 84, wy + 36))
+
+            y_offset = wy + 80
+            rows = [(k, v) for k, v in self.weather_data.items()
+                    if not k.startswith("_") and k != "Погода"]
+            for key, value in rows[:4]:
+                screen.blit(font_tiny.render(f"{key}: {value}", True, COLORS["text"]),
+                            (wx + 12, y_offset))
+                y_offset += 26
 
         draw_glow_line(screen, COLORS["primary"], (30, 416), (SCREEN_WIDTH - 30, 416), 1)
         if self.subtext:

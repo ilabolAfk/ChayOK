@@ -45,6 +45,7 @@
 | `notifier.py` | письма через SMTP |
 | `watchdog.py` | слежение за `llama-server` |
 | `start_all.sh` | запуск приложения и модели |
+| `update.sh` | обновление из репозитория и перезапуск |
 | `restart_llm.sh` | подъём `llama-server` |
 | `chayok.service`, `install_service.sh` | автозапуск через systemd |
 
@@ -85,6 +86,16 @@ sudo ./install_service.sh  # автозапуск через systemd
 ```
 
 Проверка почты: `venv/bin/python notifier.py`.
+
+## Обновление
+
+```bash
+bash update.sh
+```
+
+Скрипт забирает свежий `main` из репозитория, обновляет зависимости и перезапускает
+приложение (через systemd, если служба активна, иначе вручную). Локальные настройки
+и модели не затрагиваются — они в `.gitignore`.
 
 ## Голосовые команды
 
