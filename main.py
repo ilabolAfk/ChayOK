@@ -725,7 +725,8 @@ def speak_piper_sync(text):
         os.close(fd)
         # текст уходит в stdin, а не в shell — кавычки и $() безопасны
         res = subprocess.run(
-            [PIPER_PATH, "--model", PIPER_MODEL, "--output_file", temp_file],
+            [PIPER_PATH, "--model", PIPER_MODEL, "--output_file", temp_file,
+             "--length_scale", "1.05", "--sentence_silence", "0.35"],
             input=text.encode("utf-8"),
             capture_output=True,
             timeout=120,

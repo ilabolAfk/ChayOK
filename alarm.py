@@ -214,7 +214,8 @@ def speak(text):
         fd, temp_file = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         res = subprocess.run(
-            [PIPER_PATH, "--model", PIPER_MODEL, "--output_file", temp_file],
+            [PIPER_PATH, "--model", PIPER_MODEL, "--output_file", temp_file,
+             "--length_scale", "1.05", "--sentence_silence", "0.35"],
             input=text.encode("utf-8"),
             capture_output=True,
             timeout=60,
