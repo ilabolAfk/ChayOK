@@ -225,6 +225,49 @@ ICON_SNOW = (225, 245, 255)
 ICON_BOLT = (255, 210, 70)
 
 
+def draw_radio_waves(surface, rect, phase, energy=None):
+    """Три бегущие синусоиды — волны вместо столбиков."""
+    energy = volume.load() if energy is None else energy
+    layers = (
+        (COLORS["primary"], 0.55, 1.0),
+        (COLORS["secondary"], 0.38, 1.6),
+        (COLORS["accent"], 0.26, 2.4),
+    )
+    for color, amplitude_ratio, speed in layers:
+        amplitude = rect.height * amplitude_ratio * (0.75 + 0.25 * energy)
+        points = []
+        for x in range(rect.left, rect.right + 1, 6):
+            t = (x - rect.left) / max(1, rect.width)
+            y = rect.centery + math.sin(t * 6.28318 * 1.5 + phase * speed) * amplitude
+            points.append((x, y))
+        pygame.draw.lines(surface, color, False, points, 2)
+
+
+HOLIDAY_COLORS = ((255, 92, 92), (255, 200, 80), (120, 255, 160),
+                  (110, 190, 255), (225, 140, 255))
+
+
+def holiday_mode(now=None):
+    """Гирлянда с 1 декабря по 5 января. CHAYOK_HOLIDAY=1 включает принудительно."""
+    if os.environ.get("CHAYOK_HOLIDAY") == "1":
+        return True
+    now = now or datetime.datetime.now()
+    return now.month == 12 or (now.month == 1 and now.day <= 5)
+
+
+def draw_garland(surface, seconds):
+    spacing = 26
+    for edge_y in (5, SCREEN_HEIGHT - 6):
+        for index, x in enumerate(range(14, SCREEN_WIDTH - 8, spacing)):
+            color = HOLIDAY_COLORS[index % len(HOLIDAY_COLORS)]
+            twinkle = 0.5 + 0.5 * math.sin(seconds * 2.4 + index * 0.9)
+            intensity = 0.55 + 0.45 * twinkle
+            radius = 2 + int(2.5 * intensity)
+            pygame.draw.circle(surface, tuple(int(c * intensity) for c in color),
+                               (x, edge_y), radius)
+            pygame.draw.circle(surface, (255, 255, 255), (x, edge_y), max(1, radius // 2))
+
+
 def weather_icon_kind(code):
     code = int(code)
     if code in (0, 1):
@@ -652,7 +695,21 @@ def speak_piper(text):
     _speech_queue.put(text)
 
 
+def speech_text(text):
+    """Готовит текст для Piper: символы, на которых он запинается."""
+    text = text.replace("м/с", "метров в секунду")
+    text = text.replace("км/ч", "километров в час")
+    text = text.replace("%", " процентов")
+    text = text.replace("°C", " градусов").replace("°", " градусов")
+    text = re.sub(r"(\d)\s*\.\s*(\d)", r"\1,\2", text)        # 3.8 → 3,8
+    text = re.sub(r"(?<![\w-])-\s*(\d)", r"минус \1", text)   # -4 → минус 4
+    text = re.sub(r"(?<![\w-])\+\s*(\d)", r"плюс \1", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def speak_piper_sync(text):
+    text = speech_text(text)
     if not text or not os.path.exists(PIPER_PATH):
         return
     temp_file = None
@@ -831,9 +888,14 @@ def ask_llm_streaming(command, ui_ref):
                     full_text += piece
                     sentence_buffer += piece
                     ui_ref.response = full_text.strip()
-                    if re.search(r"[.!?…\n]", piece) and len(sentence_buffer.strip()) > 4:
-                        speak_piper(sentence_buffer.strip())
-                        sentence_buffer = ""
+                    # озвучиваем только законченное предложение: ждём точку,
+                    # вопрос или восклицание, после которых пробел или конец
+                    while True:
+                        match = re.search(r"[^.!?…]*[.!?…](?=\s|$)", sentence_buffer)
+                        if not match or len(match.group(0).strip()) < 5:
+                            break
+                        speak_piper(match.group(0).strip())
+                        sentence_buffer = sentence_buffer[match.end():].lstrip()
             finally:
                 r.close()
 
@@ -1241,6 +1303,8 @@ class ChayOKUI:
     def __init__(self):
         self.status = "Ready"
         self.response = "Я ЧайОК, голосовой помощник."
+        self.reveal = 0.0          # сколько символов ответа уже показано
+        self._last_tick = pygame.time.get_ticks()
         self.subtext = "Скажи 'ЧайОК' или нажми кнопку"
         self.weather_data = None
         self.show_buttons = True
@@ -1292,6 +1356,8 @@ class ChayOKUI:
         btn_text = font_title.render("СТОП", True, (255, 255, 255))
         screen.blit(btn_text, btn_text.get_rect(center=btn_rect.center))
         self.alarm_stop_rect = btn_rect
+        if holiday_mode():
+            draw_garland(screen, pygame.time.get_ticks() / 1000.0)
         pygame.display.flip()
 
     def update_display_alarm(self):
@@ -1352,6 +1418,7 @@ class ChayOKUI:
         if is_generating:
             return
         self.status = "Thinking..."
+        self.reveal = 0.0
         self.update_display()
 
         response, weather = process_command(command)
@@ -1373,6 +1440,18 @@ class ChayOKUI:
 
     def update_display(self):
         screen.fill(COLORS["bg"])
+
+        # посимвольный вывод ответа
+        now_ms = pygame.time.get_ticks()
+        delta = min(0.25, max(0.0, (now_ms - self._last_tick) / 1000.0))
+        self._last_tick = now_ms
+        full_text = self.response or ""
+        if self.reveal < len(full_text):
+            self.reveal = min(len(full_text), self.reveal + delta * 60)
+        elif self.reveal > len(full_text):
+            self.reveal = len(full_text)
+        visible_text = full_text[:int(self.reveal)]
+
         logo = get_logo()
         if logo:
             screen.blit(logo, (SCREEN_WIDTH - 70, SCREEN_HEIGHT - 70))
@@ -1414,20 +1493,26 @@ class ChayOKUI:
         if self.weather_data and "Ошибка" not in self.weather_data:
             card_w = SCREEN_WIDTH - 320
 
-        if self.response:
+        if full_text:
             card = pygame.Rect(30, 150, card_w, 198)
             draw_rounded_rect(screen, COLORS["card_bg"], card, radius=8)
             # только контур: draw_rounded_rect всегда заливает цветом
             pygame.draw.rect(screen, COLORS["border"], card, 1, border_radius=8)
-            lines = wrap_text(self.response, font_text, card_w - 40)
+            lines = wrap_text(visible_text, font_text, card_w - 40)
             y = 168
             max_lines = (card.height - 36) // 30
-            shown = lines[-max_lines:]
+            if radio_mod.player.active():
+                max_lines -= 1  # внизу карточки живут волны радио
+            shown = lines[-max_lines:] if lines else []
             if len(lines) > max_lines:
                 shown[0] = "… " + shown[0]
             for line in shown:
                 screen.blit(font_text.render(line, True, COLORS["text"]), (50, y))
                 y += 30
+
+            if radio_mod.player.active():
+                wave_rect = pygame.Rect(card.left + 14, card.bottom - 34, card.width - 28, 28)
+                draw_radio_waves(screen, wave_rect, now_ms / 1000.0)
 
         if self.weather_data and "Ошибка" not in self.weather_data:
             wx, wy = SCREEN_WIDTH - 280, 150
@@ -1469,6 +1554,9 @@ class ChayOKUI:
                 draw_rounded_rect(screen, color, btn["rect"], radius=8)
                 btn_text = font_button.render(btn["label"], True, (255, 255, 255))
                 screen.blit(btn_text, btn_text.get_rect(center=btn["rect"].center))
+
+        if holiday_mode():
+            draw_garland(screen, now_ms / 1000.0)
         pygame.display.flip()
 
 

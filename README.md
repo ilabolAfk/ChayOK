@@ -12,6 +12,8 @@
 
 ![Погода и прогноз](docs/screenshots/screen-weather.png)
 
+![Радио](docs/screenshots/screen-radio.png)
+
 ![Таймер](docs/screenshots/screen-timer.png)
 
 ## Что умеет
