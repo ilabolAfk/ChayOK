@@ -4,7 +4,9 @@
 в домашней сети: http://<ip>:8000
 """
 
+import glob
 import json
+import os
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +19,7 @@ import volume
 
 _status_provider = None
 _restart_callback = None
+PIPER_DIR = "/home/pi/piper"
 
 
 def _password():
@@ -27,15 +30,13 @@ def _authorized(handler):
     password = _password()
     if not password:
         return True
-    header = handler.headers.get("X-Token", "")
-    if header == password:
+    if handler.headers.get("X-Token", "") == password:
         return True
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
     return query.get("token", [""])[0] == password
 
 
 def _status():
-    stations = radio_mod.player.stations
     alarm_data = alarm.load_alarm()
     result = {
         "ok": True,
@@ -43,7 +44,7 @@ def _status():
             "active": radio_mod.player.active(),
             "station": radio_mod.player.station_name(),
             "index": radio_mod.player.index,
-            "stations": [s["name"] for s in stations],
+            "stations": [s["name"] for s in radio_mod.player.stations],
         },
         "alarm": alarm_data,
         "timer": {
@@ -75,7 +76,7 @@ PAGE = """<!DOCTYPE html>
  .sub { color:#6b7c93; font-size:13px; margin-bottom:14px; }
  .card { background:#141a24; border:1px solid #1e2a3a; border-radius:12px;
          padding:14px; margin-bottom:12px; }
- .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+ .row { display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; }
  button { background:#0d5f8f; color:#fff; border:0; border-radius:9px;
           padding:10px 14px; font-size:15px; }
  button.alt { background:#1d2734; }
@@ -84,11 +85,11 @@ PAGE = """<!DOCTYPE html>
  .status { font-size:14px; color:#8fa4bd; }
  .big { font-size:26px; font-weight:600; color:#e8f0fa; }
  input, select, textarea { background:#0f1520; color:#cfd8e6; border:1px solid #24303f;
-        border-radius:8px; padding:8px; font-size:15px; }
- textarea { width:100%; box-sizing:border-box; min-height:220px; font-family:monospace;
-            font-size:13px; }
- label { font-size:13px; color:#8fa4bd; display:block; margin:6px 0 2px; }
- .ok { color:#7ee0a5; } .warn { color:#ffb347; }
+        border-radius:8px; padding:8px; font-size:15px; width:100%; box-sizing:border-box; }
+ textarea { min-height:110px; }
+ label { font-size:13px; color:#8fa4bd; display:block; margin:10px 0 4px; }
+ .field { flex:1; min-width:130px; }
+ .ok { color:#7ee0a5; }
 </style>
 </head>
 <body>
@@ -106,7 +107,7 @@ PAGE = """<!DOCTYPE html>
     <button class="alt" onclick="api('radio',{action:'stop'})">Выключить</button>
   </div>
   <div class="row" style="margin-top:10px">
-    <select id="stations" style="flex:1"></select>
+    <select id="stations"></select>
     <button onclick="playSelected()">Играть</button>
   </div>
 </div>
@@ -133,12 +134,14 @@ PAGE = """<!DOCTYPE html>
 <div class="card">
   <label>Будильник</label>
   <div class="row">
-    <input id="alarm_time" type="time" step="60">
-    <select id="alarm_level">
+    <input id="alarm_time" type="time" step="60" style="flex:1">
+    <select id="alarm_level" style="flex:1">
       <option value="мягкий">мягкий</option>
       <option value="средний">средний</option>
       <option value="жёсткий">жёсткий</option>
     </select>
+  </div>
+  <div class="row" style="margin-top:10px">
     <button onclick="saveAlarm()">Сохранить</button>
     <button class="alt" onclick="api('alarm',{enabled:false})">Выключить</button>
   </div>
@@ -146,11 +149,63 @@ PAGE = """<!DOCTYPE html>
 </div>
 
 <div class="card">
-  <label>Настройки (config.json)</label>
-  <textarea id="cfg" spellcheck="false"></textarea>
-  <div class="row" style="margin-top:10px">
-    <button onclick="saveConfig()">Сохранить</button>
-    <button class="alt" onclick="loadConfig()">Перечитать</button>
+  <div class="status">Голос</div>
+  <label>Модель (голос)</label>
+  <select id="v_model"></select>
+  <div class="row">
+    <div class="field"><label>Темп речи</label>
+      <input id="v_len" type="number" step="0.01" min="0.7" max="1.5"></div>
+    <div class="field"><label>Пауза между фразами, с</label>
+      <input id="v_sil" type="number" step="0.05" min="0" max="1.5"></div>
+  </div>
+  <label>Характер и правила ответов</label>
+  <textarea id="v_prompt"></textarea>
+</div>
+
+<div class="card">
+  <div class="status">Слух</div>
+  <label>Слова-активаторы (через запятую)</label>
+  <input id="v_wake">
+  <div class="row">
+    <div class="field"><label>Тишина до конца команды, с</label>
+      <input id="v_silence" type="number" step="0.1" min="0.5" max="10"></div>
+    <div class="field"><label>Окно продолжения, с</label>
+      <input id="v_follow" type="number" step="1" min="0" max="30"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="status">Ответы</div>
+  <div class="row">
+    <div class="field"><label>Реплик в памяти</label>
+      <input id="v_hist" type="number" step="1" min="0" max="20"></div>
+    <div class="field"><label>Ждать ответ, с</label>
+      <input id="v_read" type="number" step="10" min="10" max="600"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="status">Погода</div>
+  <label>Город (для ответа)</label>
+  <input id="v_city">
+  <div class="row">
+    <div class="field"><label>Широта</label>
+      <input id="v_lat" type="number" step="0.0001"></div>
+    <div class="field"><label>Долгота</label>
+      <input id="v_lon" type="number" step="0.0001"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="status">Панель</div>
+  <div class="row">
+    <div class="field"><label>Порт</label>
+      <input id="v_port" type="number" min="1024" max="65535"></div>
+    <div class="field"><label>Пароль (пусто — без пароля)</label>
+      <input id="v_pw" type="password" autocomplete="new-password"></div>
+  </div>
+  <div class="row" style="margin-top:12px">
+    <button onclick="saveSettings()">Сохранить настройки</button>
     <button class="red" onclick="restartApp()">Перезапустить ЧайОК</button>
   </div>
   <div class="status" id="cfg_state" style="margin-top:8px"></div>
@@ -158,6 +213,8 @@ PAGE = """<!DOCTYPE html>
 
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
+let cfg = null;
+
 async function api(path, body) {
   const res = await fetch('/api/' + path, {
     method: body ? 'POST' : 'GET',
@@ -167,14 +224,18 @@ async function api(path, body) {
   if (!res.ok) { alert('Ошибка: ' + res.status); return null; }
   return res.json();
 }
+
+function set(id, value) { document.getElementById(id).value = value; }
+function val(id) { return document.getElementById(id).value; }
+function num(id, fallback) { const v = parseFloat(val(id)); return isNaN(v) ? fallback : v; }
+
 async function refresh() {
   const s = await api('status');
   if (!s) return;
   document.getElementById('station').textContent = s.radio.active ? s.radio.station : 'выключено';
   document.getElementById('volume').textContent = s.volume + '%';
   document.getElementById('timer').textContent = s.timer.text || '';
-  document.getElementById('sub').textContent =
-    (s.app_status ? s.app_status : 'работает') + (s.app_version ? ' · ' + s.app_version : '');
+  document.getElementById('sub').textContent = (s.app_status || 'работает');
   const a = s.alarm;
   document.getElementById('alarm_state').textContent = a.enabled
     ? ('включён на ' + String(a.hour).padStart(2,'0') + ':' + String(a.minute).padStart(2,'0') +
@@ -185,16 +246,77 @@ async function refresh() {
       String(a.hour).padStart(2,'0') + ':' + String(a.minute).padStart(2,'0');
   }
   const sel = document.getElementById('stations');
-  if (!sel.dataset.filled) {
+  if (!sel.dataset.filled && s.radio.stations.length) {
     sel.innerHTML = s.radio.stations.map((n,i) => `<option value="${i}">${n}</option>`).join('');
     sel.dataset.filled = '1';
     sel.value = s.radio.index;
   }
 }
+
+async function loadVoices() {
+  const data = await api('voices');
+  const sel = document.getElementById('v_model');
+  const list = (data && data.voices) || [];
+  sel.innerHTML = list.map(p => {
+    const name = p.split('/').pop().replace('.onnx','');
+    return `<option value="${p}">${name}</option>`;
+  }).join('');
+}
+
+async function loadSettings() {
+  cfg = await api('config');
+  if (!cfg) return;
+  set('v_model', cfg.voice.model);
+  set('v_len', cfg.voice.length_scale);
+  set('v_sil', cfg.voice.sentence_silence);
+  set('v_prompt', cfg.llm.system_prompt);
+  set('v_hist', cfg.llm.history_limit);
+  set('v_read', cfg.llm.timeout_read);
+  set('v_wake', (cfg.voice_input.wake_words || []).join(', '));
+  set('v_silence', cfg.voice_input.command_silence);
+  set('v_follow', cfg.voice_input.followup_seconds);
+  set('v_city', cfg.weather.city);
+  set('v_lat', cfg.weather.latitude);
+  set('v_lon', cfg.weather.longitude);
+  set('v_port', cfg.web.port);
+  set('v_pw', cfg.web.password || '');
+  document.getElementById('cfg_state').textContent = '';
+}
+
+async function saveSettings() {
+  if (!cfg) return;
+  const updated = JSON.parse(JSON.stringify(cfg));
+  updated.voice.model = val('v_model');
+  updated.voice.length_scale = num('v_len', 1.05);
+  updated.voice.sentence_silence = num('v_sil', 0.35);
+  updated.llm.system_prompt = val('v_prompt');
+  updated.llm.history_limit = Math.round(num('v_hist', 4));
+  updated.llm.timeout_read = Math.round(num('v_read', 180));
+  updated.voice_input.wake_words = val('v_wake').split(',')
+      .map(w => w.trim().toLowerCase()).filter(w => w.length > 0);
+  updated.voice_input.command_silence = num('v_silence', 2.5);
+  updated.voice_input.followup_seconds = num('v_follow', 5);
+  updated.weather.city = val('v_city');
+  updated.weather.latitude = num('v_lat', 55.7558);
+  updated.weather.longitude = num('v_lon', 37.6173);
+  updated.web.port = Math.round(num('v_port', 8000));
+  updated.web.password = val('v_pw');
+
+  const saved = await api('config', updated);
+  if (saved) {
+    cfg = saved;
+    document.getElementById('cfg_state').textContent =
+      'сохранено — нажмите «Перезапустить ЧайОК», чтобы применить';
+  } else {
+    document.getElementById('cfg_state').textContent = 'не сохранилось';
+  }
+}
+
 async function playSelected() {
   await api('radio', {action: 'start', station: Number(document.getElementById('stations').value)});
   refresh();
 }
+
 async function saveAlarm() {
   const t = document.getElementById('alarm_time').value.split(':');
   await api('alarm', {
@@ -203,25 +325,14 @@ async function saveAlarm() {
   });
   refresh();
 }
-async function loadConfig() {
-  const cfg = await api('config');
-  document.getElementById('cfg').value = JSON.stringify(cfg, null, 2);
-}
-async function saveConfig() {
-  const el = document.getElementById('cfg');
-  let parsed;
-  try { parsed = JSON.parse(el.value); }
-  catch (e) { document.getElementById('cfg_state').textContent = 'JSON с ошибкой: ' + e.message; return; }
-  const res = await api('config', parsed);
-  document.getElementById('cfg_state').textContent = res ? 'сохранено' : 'не сохранилось';
-  if (res) el.value = JSON.stringify(res, null, 2);
-}
+
 async function restartApp() {
   if (!confirm('Перезапустить ЧайОК?')) return;
   const res = await api('restart', {});
   document.getElementById('cfg_state').textContent = res ? 'перезапускаю…' : 'не вышло';
 }
-loadConfig();
+
+loadVoices().then(loadSettings);
 refresh();
 setInterval(refresh, 3000);
 </script>
@@ -268,6 +379,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/config":
             self._json(config.as_dict())
+            return
+        if path == "/api/voices":
+            files = sorted(glob.glob(os.path.join(PIPER_DIR, "*.onnx")))
+            self._json({"voices": files})
             return
         self._send(404, "not found", "text/plain")
 
