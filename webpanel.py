@@ -366,7 +366,7 @@ async function pollUpdate() {
     box.scrollTop = box.scrollHeight;
     if (!data.running && updTimer) { clearInterval(updTimer); updTimer = null; }
   } catch (e) {
-    box.textContent += '\n… панель недоступна, ждём перезапуска';
+    box.textContent += '\\n… панель недоступна, ждём перезапуска';
   }
 }
 
