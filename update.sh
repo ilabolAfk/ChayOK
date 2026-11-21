@@ -31,29 +31,15 @@ if [ -x venv/bin/pip ] && [ -f requirements.txt ]; then
     venv/bin/pip install -q -r requirements.txt || echo "pip: зависимости обновить не удалось"
 fi
 
-restart_app() {
-    pkill -f 'python -u main.py' 2>/dev/null
-    sleep 2
-    nohup bash start_all.sh > /tmp/chayok_run.log 2>&1 &
-    echo "-- запущено вручную, лог /tmp/chayok_run.log"
-}
+echo "-- перезапуск приложения"
+# Приложение само подхватит изменения и сделает execv: без kill и без дублей
+touch /tmp/chayok_reload
+sleep 6
 
-echo "-- перезапуск"
-if systemctl is-active --quiet chayok 2>/dev/null; then
-    if sudo -n systemctl restart chayok 2>/dev/null; then
-        echo "-- служба chayok перезапущена"
-    else
-        echo "-- для systemctl нужен пароль sudo, перезапускаю вручную"
-        restart_app
-    fi
+if pgrep -f 'main\.py' > /dev/null 2>&1; then
+    echo "== Готово: $VERSION, приложение перезапускается по флагу =="
 else
-    restart_app
-fi
-
-sleep 3
-if pgrep -f 'python -u main.py' > /dev/null; then
-    echo "== Готово: $VERSION, приложение работает =="
-else
-    echo "== Обновлено до $VERSION, но приложение не поднялось — смотрите /tmp/chayok_run.log =="
+    echo "== Обновлено до $VERSION, но приложение не запущено =="
+    echo "   Поднять: sudo systemctl start chayok  (или ./start_all.sh)"
     exit 1
 fi

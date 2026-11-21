@@ -7,6 +7,7 @@
 import glob
 import json
 import os
+import subprocess
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +21,8 @@ import volume
 _status_provider = None
 _restart_callback = None
 PIPER_DIR = "/home/pi/piper"
+BASE_DIR = "/home/pi/ChayOK"
+UPDATE_LOG = "/tmp/chayok_update.log"
 
 
 def _password():
@@ -211,6 +214,15 @@ PAGE = """<!DOCTYPE html>
   <div class="status" id="cfg_state" style="margin-top:8px"></div>
 </div>
 
+<div class="card">
+  <div class="status">Обновление</div>
+  <div class="row" style="margin-top:8px">
+    <button onclick="runUpdate()">Обновить из GitHub</button>
+  </div>
+  <pre id="upd_log" style="background:#0f1520;border:1px solid #24303f;border-radius:8px;
+       padding:8px;font-size:12px;max-height:200px;overflow:auto;margin:10px 0 0"></pre>
+</div>
+
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
 let cfg = null;
@@ -332,6 +344,32 @@ async function restartApp() {
   document.getElementById('cfg_state').textContent = res ? 'перезапускаю…' : 'не вышло';
 }
 
+let updTimer = null;
+
+async function runUpdate() {
+  if (!confirm('Забрать обновление из GitHub и перезапустить?')) return;
+  const r = await api('update', {});
+  if (!r) return;
+  document.getElementById('upd_log').textContent = 'запущено…';
+  if (updTimer) clearInterval(updTimer);
+  updTimer = setInterval(pollUpdate, 2000);
+  pollUpdate();
+}
+
+async function pollUpdate() {
+  const box = document.getElementById('upd_log');
+  try {
+    const res = await fetch('/api/update/log', {headers: {'X-Token': token}});
+    if (!res.ok) throw new Error('нет ответа');
+    const data = await res.json();
+    box.textContent = data.log || '…';
+    box.scrollTop = box.scrollHeight;
+    if (!data.running && updTimer) { clearInterval(updTimer); updTimer = null; }
+  } catch (e) {
+    box.textContent += '\n… панель недоступна, ждём перезапуска';
+  }
+}
+
 loadVoices().then(loadSettings);
 refresh();
 setInterval(refresh, 3000);
@@ -383,6 +421,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/voices":
             files = sorted(glob.glob(os.path.join(PIPER_DIR, "*.onnx")))
             self._json({"voices": files})
+            return
+        if path == "/api/update/log":
+            lines = []
+            try:
+                with open(UPDATE_LOG, "r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.read().splitlines()[-40:]
+            except FileNotFoundError:
+                pass
+            running = subprocess.run(["pgrep", "-f", "update.sh"],
+                                     capture_output=True).returncode == 0
+            self._json({"running": running, "log": "\n".join(lines)})
             return
         self._send(404, "not found", "text/plain")
 
@@ -442,6 +491,15 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/api/config":
                 self._json(config.save(data))
+                return
+
+            if path == "/api/update":
+                log_handle = open(UPDATE_LOG, "wb")
+                subprocess.Popen(["bash", os.path.join(BASE_DIR, "update.sh")],
+                                 stdout=log_handle, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+                log_handle.close()
+                self._json({"result": "обновление запущено"})
                 return
 
             if path == "/api/restart":

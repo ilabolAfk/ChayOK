@@ -59,6 +59,7 @@ FOLLOWUP_SECONDS = float(config.get("voice_input", "followup_seconds", default=5
 BASE_DIR = "/home/pi"
 PROJECT_DIR = os.path.join(BASE_DIR, "ChayOK")
 SOUNDS_DIR = os.path.join(PROJECT_DIR, "sounds")
+RELOAD_FLAG = "/tmp/chayok_reload"
 
 VOSK_MODEL_PATH = os.path.join(PROJECT_DIR, "vosk-model")
 PIPER_PATH = config.get("voice", "piper", default=os.path.join(BASE_DIR, "piper/piper"))
@@ -1627,12 +1628,26 @@ def panel_status():
 
 
 def restart_app():
-    """Перезапуск на месте: тот же процесс, новый код и конфиг."""
-    def run():
-        time.sleep(0.8)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+    """Перезапуск на месте: ставим флаг, наблюдатель сделает execv."""
+    try:
+        with open(RELOAD_FLAG, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except Exception as e:
+        print("не смог поставить флаг перезапуска:", e)
 
-    threading.Thread(target=run, daemon=True).start()
+
+def watch_reload():
+    """Ждёт флаг от update.sh или веб-панели и перезапускает процесс."""
+    while True:
+        if os.path.exists(RELOAD_FLAG):
+            try:
+                os.unlink(RELOAD_FLAG)
+            except Exception:
+                pass
+            print("перезапуск по флагу")
+            time.sleep(0.3)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        time.sleep(1.5)
 
 
 def install_crash_hook():
@@ -1689,6 +1704,7 @@ def main():
         key="start",
     )
     watchdog.start()
+    threading.Thread(target=watch_reload, daemon=True).start()
     webpanel.start(status_provider=panel_status, restart_callback=restart_app)
 
     ui = ChayOKUI()
