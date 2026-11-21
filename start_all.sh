@@ -1,36 +1,45 @@
 #!/bin/bash
 # ========================================
-# ChayOK — полный запуск
+# ChayOK — ручной запуск (для терминала)
+# Для автозапуска: sudo ./install_service.sh
 # ========================================
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}   ChayOK — запуск голосового помощника${NC}"
-echo -e "${GREEN}========================================${NC}"
-
+set -u
 cd /home/pi/ChayOK || exit 1
 
-# 1. Активация venv
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-/home/pi/.Xauthority}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export PULSE_SERVER="${PULSE_SERVER:-unix:/run/user/$(id -u)/pulse/native}"
+
 if [ -f "venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
     source venv/bin/activate
 else
-    echo -e "${RED}venv не найден!${NC}"
+    echo "venv не найден в /home/pi/ChayOK" >&2
     exit 1
 fi
 
-# 2. Проверка Ollama на ПК (опционально)
-echo -e "${YELLOW}[1/2] Проверяю связь с сервером Ollama...${NC}"
-if curl -s --connect-timeout 3 http://192.168.1.108:11434/api/tags > /dev/null; then
-    echo -e "${GREEN}  -> Сервер Ollama доступен.${NC}"
-else
-    echo -e "${YELLOW}  -> Сервер недоступен, будет использована локальная модель.${NC}"
+# Bonsai (llama.cpp) — поднимаем, если ещё не отвечает
+BONSAI_URL="http://127.0.0.1:8080/v1/models"
+if ! curl -sf -m 2 "$BONSAI_URL" > /dev/null; then
+    if [ -x /home/pi/llama.cpp/build/bin/llama-server ]; then
+        echo "Запускаю Bonsai (llama.cpp)..."
+        cd /home/pi/llama.cpp || exit 1
+        nohup ./build/bin/llama-server \
+            -m "models/${CHAYOK_MODEL:-Bonsai-4B-Q1_0.gguf}" \
+            --host 127.0.0.1 --port 8080 \
+            -c 2048 -t 4 --no-webui \
+            > /tmp/bonsai.log 2>&1 &
+        cd /home/pi/ChayOK || exit 1
+        for _ in $(seq 1 30); do
+            curl -sf -m 2 "$BONSAI_URL" > /dev/null && break
+            sleep 1
+        done
+    else
+        echo "llama-server не найден — останется резервный сервер на ПК" >&2
+    fi
 fi
 
-# 3. Запуск
-echo -e "${YELLOW}[2/2] Запускаю ChayOK...${NC}"
-echo -e "${GREEN}========================================${NC}"
-python3 main.py
+echo "Запускаю ChayOK..."
+exec python -u main.py

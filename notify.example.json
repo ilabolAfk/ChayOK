@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 465,
+  "user": "you@gmail.com",
+  "password": "",
+  "to": "you@gmail.com",
+  "min_interval_sec": 300
+}

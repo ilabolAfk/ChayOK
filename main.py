@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """
-ЧайОК — финальная версия
-Потоковая генерация, анекдоты, радио с экраном выбора
+ЧайОК — версия 2 (Pi 4, Bonsai 1.7B через llama.cpp)
+Потоковая генерация, озвучка по предложениям, анекдоты и радио
 """
 
-import os
-import sys
-import json
-import time
-import threading
-import subprocess
-import tempfile
 import datetime
-import tkinter as tk
-from tkinter import scrolledtext
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
 
-import vosk
 import pygame
 import requests
+import vosk
+
+try:
+    import tkinter as tk
+    from tkinter import scrolledtext
+    HAS_TK = True
+except ImportError:
+    HAS_TK = False
 
 try:
     import smbus2
@@ -27,6 +36,12 @@ except ImportError:
 
 import alarm
 import addition
+import audio_guard
+import notifier
+import radio as radio_mod
+import timer as timer_mod
+import volume
+import watchdog
 
 # ========================================
 # НАСТРОЙКИ
@@ -34,32 +49,48 @@ import addition
 
 WAKE_WORDS = ["чайок", "чаек", "чаёк", "чай ок"]
 COMMAND_SILENCE = 2.5
+HISTORY_LIMIT = 4        # сколько последних реплик держать в контексте
+FOLLOWUP_SECONDS = 5     # окно продолжения без слова-активатора
 
 BASE_DIR = "/home/pi"
-VOSK_MODEL_PATH = os.path.join(BASE_DIR, "ChayOK/vosk-model")
+PROJECT_DIR = os.path.join(BASE_DIR, "ChayOK")
+
+VOSK_MODEL_PATH = os.path.join(PROJECT_DIR, "vosk-model")
 PIPER_PATH = os.path.join(BASE_DIR, "piper/piper")
 PIPER_MODEL = os.path.join(BASE_DIR, "piper/ru_RU-ruslan-medium.onnx")
 
-# --- LLM (Сервер + Fallback) ---
-SERVER_OLLAMA_URL = "http://192.168.1.108:11434/api/chat"  # IP твоего ПК
-SERVER_OLLAMA_MODEL = "qwen2.5:7b-instruct"
+# --- LLM: сначала локальный Bonsai (llama.cpp), потом сервер на ПК ---
+LLM_PROVIDERS = [
+    {
+        "kind": "completion",
+        "url": "http://127.0.0.1:8080/completion",
+        "name": "Bonsai (Pi, llama.cpp)",
+        "max_tokens": 160,
+    },
+    {
+        "kind": "ollama",
+        "url": "http://192.168.1.108:11434/api/chat",
+        "model": "qwen2.5:7b-instruct",
+        "name": "Сервер (ПК)",
+        "max_tokens": 220,
+    },
+]
+LLM_TIMEOUT = (5, 180)
+LLM_SYSTEM_PROMPT = (
+    "Ты — ЧайОК, голосовой помощник в маленьком устройстве. "
+    "Отвечай по-русски, кратко: одно-два предложения, без списков и разметки. "
+    "Никогда не пиши даты в формате ГГГГ-ММ-ДД — называй дату словами."
+)
 
-LOCAL_OLLAMA_URL = "http://localhost:11434/api/chat"
-LOCAL_OLLAMA_MODEL = "qwen2.5:0.5b-instruct"
+WEATHER_API_KEY = os.environ.get("CHAYOK_WEATHER_KEY", "")
+CITY = "Москва"
 
-WEATHER_API_KEY = "ТВОЙ_КЛЮЧ_СЮДА"
-CITY = "Moscow"
-
-AUDIO_RATE = 44100
+AUDIO_RATE = 16000        # Vosk обучен на 16 кГц
 AUDIO_CHANNELS = 1
-AUDIO_CHUNK = 1024
+AUDIO_CHUNK = 4000        # ~125 мс при 16 кГц / 16 бит
 
-# --- УСТРОЙСТВА ---
-# Если микрофон и колонка на одной карте (card 1), то:
-MIC_CARD = 1
-MIC_DEVICE = 0
-SPK_CARD = 1
-SPK_DEVICE = 0
+MIC_DEVICE = os.environ.get("CHAYOK_MIC", "")   # пусто = определить автоматически
+SPK_DEVICE = os.environ.get("CHAYOK_SPK", "")   # пусто = определить автоматически
 
 SCREEN_WIDTH = 800
 SCREEN_HEIGHT = 480
@@ -67,6 +98,13 @@ SCREEN_HEIGHT = 480
 alarm_pending = None
 is_generating = False
 audio_lock = threading.Lock()
+dialogue_history = []      # последние реплики для контекста
+followup_until = 0.0       # до этого времени слушаем без слова-активатора
+pending_followup = False   # открыть окно, как только закончим говорить
+
+# PipeWire в пользовательской сессии — без этого pw-play не находит сокет
+if "XDG_RUNTIME_DIR" not in os.environ:
+    os.environ["XDG_RUNTIME_DIR"] = "/run/user/%d" % os.getuid()
 
 # ========================================
 # ЦВЕТА
@@ -91,75 +129,170 @@ COLORS = {
 # ЭКРАН
 # ========================================
 
-os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")
+# звук выводят pw-play/aplay, микшер pygame не нужен — иначе он засоряет лог underrun'ами
+os.environ["SDL_AUDIODRIVER"] = "dummy"
 pygame.init()
+pygame.mixer.quit()
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.NOFRAME)
 pygame.display.set_caption("ChayOK")
 
-try:
-    font_title = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-Bold.ttf", 52)
-    font_status = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-Medium.ttf", 38)
-    font_text = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf", 24)
-    font_small = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf", 18)
-    font_tiny = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf", 14)
-    font_button = pygame.font.Font("/usr/share/fonts/truetype/ubuntu/Ubuntu-Medium.ttf", 16) # Чуть меньше для 7 кнопок
-except:
-    font_title = pygame.font.Font(None, 52)
-    font_status = pygame.font.Font(None, 38)
-    font_text = pygame.font.Font(None, 24)
-    font_small = pygame.font.Font(None, 18)
-    font_tiny = pygame.font.Font(None, 14)
-    font_button = pygame.font.Font(None, 16)
+FONT_DIRS = [
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts/truetype",
+]
+
+
+def load_font(size, bold=False):
+    names = (
+        ["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "NotoSans-Bold.ttf"]
+        if bold
+        else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "NotoSans-Regular.ttf"]
+    )
+    for directory in FONT_DIRS:
+        for name in names:
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                try:
+                    return pygame.font.Font(path, size)
+                except Exception:
+                    pass
+    return pygame.font.Font(None, size)
+
+
+font_title = load_font(52, bold=True)
+font_status = load_font(32)
+font_clock = load_font(40, bold=True)
+font_text = load_font(24)
+font_small = load_font(18)
+font_tiny = load_font(14)
+font_button = load_font(16)
+
+WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
+          "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+_alarm_cache = {"ts": 0.0, "data": None}
+
+
+def cached_alarm():
+    """Настройки будильника с кэшем на 2 с — чтобы не читать файл каждый кадр."""
+    now = time.time()
+    if _alarm_cache["data"] is None or now - _alarm_cache["ts"] > 2:
+        _alarm_cache["data"] = alarm.load_alarm()
+        _alarm_cache["ts"] = now
+    return _alarm_cache["data"]
 
 # ========================================
 # ВСПОМОГАТЕЛЬНЫЕ
 # ========================================
 
+
 def draw_rounded_rect(surface, color, rect, radius=6, border_width=0, border_color=None):
     x, y, w, h = rect
-    if w <= 0 or h <= 0: return
+    if w <= 0 or h <= 0:
+        return
+    radius = max(0, min(radius, w // 2, h // 2))
     pygame.draw.rect(surface, color, (x + radius, y, w - radius * 2, h))
     pygame.draw.rect(surface, color, (x, y + radius, w, h - radius * 2))
-    for cx, cy in [(x + radius, y + radius), (x + w - radius, y + radius), (x + radius, y + h - radius), (x + w - radius, y + h - radius)]:
+    for cx, cy in [
+        (x + radius, y + radius),
+        (x + w - radius, y + radius),
+        (x + radius, y + h - radius),
+        (x + w - radius, y + h - radius),
+    ]:
         pygame.draw.circle(surface, color, (cx, cy), radius)
     if border_width > 0 and border_color:
         pygame.draw.rect(surface, border_color, (x, y, w, h), border_width, border_radius=radius)
 
+
 def draw_glow_line(surface, color, start, end, width=2):
+    pygame.draw.line(surface, (color[0] // 2, color[1] // 2, color[2] // 2), start, end, width + 4)
     pygame.draw.line(surface, color, start, end, width)
-    pygame.draw.line(surface, (color[0]//2, color[1]//2, color[2]//2), start, end, width + 4)
+
+
+def commands_path():
+    return os.path.join(PROJECT_DIR, "custom_commands.json")
+
 
 def load_custom_commands():
     try:
-        with open(os.path.join(BASE_DIR, "ChayOK/custom_commands.json"), "r", encoding="utf-8") as f:
+        with open(commands_path(), "r", encoding="utf-8") as f:
             return json.load(f).get("commands", [])
-    except: return []
+    except Exception:
+        return []
+
 
 def save_custom_commands(commands):
-    with open(os.path.join(BASE_DIR, "ChayOK/custom_commands.json"), "w", encoding="utf-8") as f:
+    with open(commands_path(), "w", encoding="utf-8") as f:
         json.dump({"commands": commands}, f, ensure_ascii=False, indent=2)
 
+
+def run_custom_command(command_text):
+    """Выполняет первую совпавшую пользовательскую команду."""
+    for cmd in custom_commands:
+        if cmd.lower() in command_text:
+            try:
+                subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return cmd
+            except Exception as e:
+                print("Ошибка запуска команды:", e)
+                return None
+    return None
+
+
 # ========================================
-# ЗАРЯД БАТАРЕИ
+# ЗАРЯД БАТАРЕИ (шина I2C открывается один раз)
 # ========================================
+
+_battery_bus = None
+_battery_failed = False
+
 
 def get_battery_level():
-    if not HAS_SMBUS: return None
+    global _battery_bus, _battery_failed
+    if not HAS_SMBUS or _battery_failed:
+        return None
     try:
-        bus = smbus2.SMBus(1)
-        raw = bus.read_word_data(0x42, 0x02)
+        if _battery_bus is None:
+            _battery_bus = smbus2.SMBus(1)
+        raw = _battery_bus.read_word_data(0x42, 0x02)
         voltage_raw = ((raw & 0xFF) << 8) | ((raw >> 8) & 0xFF)
         voltage_mv = (voltage_raw >> 3) * 4
-        if voltage_mv > 8400: return 100
-        elif voltage_mv < 6000: return 0
-        else: return max(0, min(100, int((voltage_mv - 6000) / (8400 - 6000) * 100)))
-    except Exception: return None
+        if voltage_mv > 8400:
+            return 100
+        if voltage_mv < 6000:
+            return 0
+        return max(0, min(100, int((voltage_mv - 6000) / (8400 - 6000) * 100)))
+    except Exception:
+        # при ошибке один раз закрываем шину и больше не дёргаем железо
+        _battery_failed = True
+        if _battery_bus is not None:
+            try:
+                _battery_bus.close()
+            except Exception:
+                pass
+            _battery_bus = None
+        return None
+
 
 # ========================================
-# РЕДАКТОРЫ И ОКНА
+# РЕДАКТОРЫ
 # ========================================
+
 
 def open_script_editor():
+    if not HAS_TK:
+        print("tkinter не установлен")
+        return
+
     def save_script():
         commands = [line.strip() for line in text_area.get("1.0", tk.END).strip().split("\n") if line.strip()]
         save_custom_commands(commands)
@@ -171,20 +304,27 @@ def open_script_editor():
     root = tk.Tk()
     root.title("Редактор скриптов ЧайОК")
     root.geometry("600x400")
-    tk.Label(root, text="Введи команды (по одной на строку):", font=("Arial", 12)).pack(pady=5)
-    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("Courier", 12))
+    tk.Label(root, text="Введи команды (по одной на строку):", font=("DejaVu Sans", 12)).pack(pady=5)
+    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("DejaVu Sans Mono", 12))
     text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
     commands = load_custom_commands()
     text_area.insert("1.0", "\n".join(commands) if commands else "включи свет\nвыключи свет")
     btn_frame = tk.Frame(root)
     btn_frame.pack(pady=5)
-    tk.Button(btn_frame, text="Сохранить", command=save_script, bg="lightgreen", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="Закрыть", command=root.destroy, bg="lightcoral", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
-    status_label = tk.Label(root, text="", font=("Arial", 10))
+    tk.Button(btn_frame, text="Сохранить", command=save_script, bg="lightgreen",
+              font=("DejaVu Sans", 10)).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Закрыть", command=root.destroy, bg="lightcoral",
+              font=("DejaVu Sans", 10)).pack(side=tk.LEFT, padx=5)
+    status_label = tk.Label(root, text="", font=("DejaVu Sans", 10))
     status_label.pack()
     root.mainloop()
 
+
 def open_alarm_editor():
+    if not HAS_TK:
+        print("tkinter не установлен")
+        return
+
     def save_alarm_settings():
         try:
             hour, minute = int(hour_var.get()), int(minute_var.get())
@@ -207,7 +347,7 @@ def open_alarm_editor():
     root.title("Будильник ЧайОК")
     root.geometry("400x320")
     current = alarm.load_alarm()
-    tk.Label(root, text="Настройка будильника", font=("Arial", 14, "bold")).pack(pady=10)
+    tk.Label(root, text="Настройка будильника", font=("DejaVu Sans", 14, "bold")).pack(pady=10)
     time_frame = tk.Frame(root)
     time_frame.pack(pady=5)
     tk.Label(time_frame, text="Часы:").pack(side=tk.LEFT, padx=5)
@@ -218,207 +358,417 @@ def open_alarm_editor():
     tk.Entry(time_frame, textvariable=minute_var, width=5).pack(side=tk.LEFT)
     level_frame = tk.Frame(root)
     level_frame.pack(pady=15)
-    tk.Label(level_frame, text="Уровень жёсткости:", font=("Arial", 12)).pack()
+    tk.Label(level_frame, text="Уровень жёсткости:", font=("DejaVu Sans", 12)).pack()
     level_var = tk.StringVar(value=current.get("level", "средний"))
     for lvl in ["мягкий", "средний", "жёсткий"]:
-        tk.Radiobutton(level_frame, text=lvl.capitalize(), variable=level_var, value=lvl, font=("Arial", 11)).pack(anchor="w", padx=20)
+        tk.Radiobutton(level_frame, text=lvl.capitalize(), variable=level_var,
+                       value=lvl, font=("DejaVu Sans", 11)).pack(anchor="w", padx=20)
     btn_frame = tk.Frame(root)
     btn_frame.pack(pady=15)
-    tk.Button(btn_frame, text="Сохранить", command=save_alarm_settings, bg="lightgreen", font=("Arial", 11), width=12).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="Отключить", command=disable_alarm, bg="lightyellow", font=("Arial", 11), width=12).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="Закрыть", command=root.destroy, bg="lightcoral", font=("Arial", 11), width=12).pack(side=tk.LEFT, padx=5)
-    status_label = tk.Label(root, text="", font=("Arial", 10))
+    tk.Button(btn_frame, text="Сохранить", command=save_alarm_settings, bg="lightgreen",
+              font=("DejaVu Sans", 11), width=12).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Отключить", command=disable_alarm, bg="lightyellow",
+              font=("DejaVu Sans", 11), width=12).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Закрыть", command=root.destroy, bg="lightcoral",
+              font=("DejaVu Sans", 11), width=12).pack(side=tk.LEFT, padx=5)
+    status_label = tk.Label(root, text="", font=("DejaVu Sans", 10))
     status_label.pack()
     root.mainloop()
 
-def open_radio_editor():
-    """Окно выбора радиостанции с ручным вводом частоты/названия."""
-    def play_selected(station):
-        result = addition.play_radio(station)
-        status_label.config(text=result)
-        root.after(1500, root.destroy) # Закрываем окно через 1.5 сек
-
-    def play_from_input():
-        value = entry_var.get().strip()
-        if not value:
-            status_label.config(text="Введи частоту или название станции.")
-            return
-        play_selected(value)
-
-    def stop_current():
-        result = addition.stop_radio()
-        status_label.config(text=result)
-
-    def refresh_stations(event=None):
-        # Обновляем список кнопок по фильтру из поля ввода.
-        query = entry_var.get().strip().lower()
-        for w in buttons_frame.winfo_children():
-            w.destroy()
-        stations = addition.list_stations()
-        if query:
-            shown = [s for s in stations if query in s.lower()]
-        else:
-            shown = stations
-        if not shown:
-            tk.Label(buttons_frame, text="(нет подходящих станций)", font=("Arial", 11),
-                     fg="gray").pack(pady=5)
-        for s in shown:
-            tk.Button(buttons_frame, text=s.upper(), font=("Arial", 11), width=28,
-                      command=lambda st=s: play_selected(st)).pack(pady=3)
-
-    root = tk.Tk()
-    root.title("Радио ЧайОК")
-    root.geometry("380x520")
-
-    tk.Label(root, text="Введи частоту или название:", font=("Arial", 12, "bold")).pack(pady=(12, 2))
-
-    entry_var = tk.StringVar()
-    entry_var.trace_add("write", refresh_stations)
-    entry = tk.Entry(root, textvariable=entry_var, font=("Arial", 14), justify="center")
-    entry.pack(fill=tk.X, padx=20, pady=6)
-    entry.focus_set()
-
-    tk.Button(root, text="Включить", font=("Arial", 12, "bold"), width=25,
-              command=play_from_input).pack(pady=6)
-
-    buttons_frame = tk.Frame(root)
-    buttons_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-
-    refresh_stations()
-
-    tk.Button(root, text="ОСТАНОВИТЬ", font=("Arial", 12, "bold"), fg="red", width=25,
-              command=stop_current).pack(pady=5)
-    tk.Button(root, text="Закрыть", font=("Arial", 12), width=25,
-              command=root.destroy).pack(pady=5)
-
-    status_label = tk.Label(root, text="", font=("Arial", 10), fg="blue")
-    status_label.pack(pady=8)
-
-    root.mainloop()
 
 # ========================================
 # ПОГОДА
 # ========================================
 
-def get_weather_now(city=CITY):
-    if not WEATHER_API_KEY or WEATHER_API_KEY == "ТВОЙ_КЛЮЧ_СЮДА": return {"Ошибка": "API ключ не установлен"}
+
+def weather_key():
+    if WEATHER_API_KEY:
+        return WEATHER_API_KEY
     try:
-        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
-        r = requests.get(url, timeout=10)
+        with open(os.path.join(PROJECT_DIR, "api.txt"), encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def get_weather_now(city=CITY):
+    key = weather_key()
+    if not key:
+        return {"Ошибка": "API ключ не установлен"}
+    try:
+        url = "http://api.openweathermap.org/data/2.5/weather"
+        r = requests.get(url, params={"q": city, "appid": key, "units": "metric", "lang": "ru"}, timeout=10)
         if r.status_code == 200:
             d = r.json()
+            temperature = round(d["main"]["temp"])
+            feels = round(d["main"]["feels_like"])
             return {
-                "Температура": f"{round(d['main']['temp'])} градусов",
-                "Ощущается": f"{round(d['main']['feels_like'])} градусов",
-                "Погода": d['weather'][0]['description'],
+                "Температура": f"{temperature} {_plural(temperature, 'градус', 'градуса', 'градусов')}",
+                "Ощущается": f"{feels} {_plural(feels, 'градус', 'градуса', 'градусов')}",
+                "Погода": d["weather"][0]["description"],
                 "Влажность": f"{d['main']['humidity']}%",
-                "Ветер": f"{d['wind']['speed']} м/с"
+                "Ветер": f"{d['wind']['speed']} м/с",
             }
         return {"Ошибка": f"Код {r.status_code}"}
-    except Exception as e: return {"Ошибка": str(e)}
+    except Exception as e:
+        return {"Ошибка": str(e)}
+
 
 def get_weather_forecast(city=CITY, days=7):
-    if not WEATHER_API_KEY or WEATHER_API_KEY == "ТВОЙ_КЛЮЧ_СЮДА": return {"Ошибка": "API ключ не установлен"}
+    key = weather_key()
+    if not key:
+        return {"Ошибка": "API ключ не установлен"}
     try:
-        url = f"http://api.openweathermap.org/data/2.5/forecast?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
-        r = requests.get(url, timeout=10)
+        url = "http://api.openweathermap.org/data/2.5/forecast"
+        r = requests.get(url, params={"q": city, "appid": key, "units": "metric", "lang": "ru"}, timeout=10)
         if r.status_code == 200:
             data = r.json()
             result = {}
             seen = set()
-            months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-            for item in data['list']:
-                date_iso = item['dt_txt'][:10]
-                if date_iso in seen: continue
-                if item['dt_txt'][11:16] == "12:00" or not result:
+            months = ["января", "февраля", "марта", "апреля", "мая", "июня",
+                      "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+            for item in data["list"]:
+                date_iso = item["dt_txt"][:10]
+                if date_iso in seen:
+                    continue
+                if item["dt_txt"][11:16] == "12:00" or not result:
                     dt = datetime.datetime.strptime(date_iso, "%Y-%m-%d")
                     date_ru = f"{dt.day} {months[dt.month - 1]}"
-                    result[date_ru] = f"{round(item['main']['temp'])} градусов, {item['weather'][0]['description']}"
+                    temp = round(item["main"]["temp"])
+                    result[date_ru] = (f"{temp} {_plural(temp, 'градус', 'градуса', 'градусов')}, "
+                                       f"{item['weather'][0]['description']}")
                     seen.add(date_iso)
-                if len(result) >= days: break
+                if len(result) >= days:
+                    break
             return result
         return {"Ошибка": f"Код {r.status_code}"}
-    except Exception as e: return {"Ошибка": str(e)}
+    except Exception as e:
+        return {"Ошибка": str(e)}
+
+
+def datetime_strptime(date_iso):
+    import datetime
+    return datetime.datetime.strptime(date_iso, "%Y-%m-%d")
+
+
+# ========================================
+# ЗВУК: определение устройств и воспроизведение
+# ========================================
+
+_mic_device = None
+_spk_device = None
+
+
+def _parse_alsa(pflag):
+    try:
+        out = subprocess.run(["aplay" if pflag == "p" else "arecord", "-l"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    return re.findall(r"card (\d+):\s*([^\[]+)\[([^\]]*)\]", out)
+
+
+def get_mic_device():
+    """Первый USB-захват (USB PnP Sound Device), иначе plughw:0,0."""
+    global _mic_device
+    if _mic_device:
+        return _mic_device
+    if MIC_DEVICE:
+        _mic_device = MIC_DEVICE
+        return _mic_device
+    for card, name, _ in _parse_alsa("c"):
+        if "usb" in name.lower() or "pnp" in name.lower():
+            _mic_device = f"plughw:{card},0"
+            return _mic_device
+    cards = _parse_alsa("c")
+    _mic_device = f"plughw:{cards[0][0]},0" if cards else "plughw:0,0"
+    return _mic_device
+
+
+def get_spk_device():
+    """Карта вывода: предпочитаем USB-колонку, а не встроенные наушники."""
+    global _spk_device
+    if _spk_device:
+        return _spk_device
+    if SPK_DEVICE:
+        _spk_device = SPK_DEVICE
+        return _spk_device
+    cards = _parse_alsa("p")
+    for card, name, _ in cards:
+        if "usb" in name.lower() or "uac" in name.lower():
+            _spk_device = f"plughw:{card},0"
+            return _spk_device
+    _spk_device = f"plughw:{cards[0][0]},0" if cards else "plughw:0,0"
+    return _spk_device
+
+
+_play_via_pw = None
+
+
+def play_wav(path, level=None):
+    """Играет wav через PipeWire, при неудаче — через ALSA.
+
+    На всё время звука поднимается audio_guard.audio_playing: микрофон в это
+    время не кормит распознавание, поэтому ЧайОК не слышит сам себя.
+    """
+    global _play_via_pw
+    level = volume.load() if level is None else max(0.0, min(1.0, level))
+    audio_guard.audio_playing.set()
+    try:
+        with audio_lock:
+            if _play_via_pw is not False:
+                try:
+                    res = subprocess.run(["pw-play", f"--volume={level:.2f}", path],
+                                         capture_output=True, timeout=180)
+                    if res.returncode == 0:
+                        _play_via_pw = True
+                        return
+                except Exception:
+                    pass
+                _play_via_pw = False
+            try:
+                subprocess.run(["aplay", "-q", "-D", get_spk_device(), path],
+                               capture_output=True, timeout=180)
+            except Exception as e:
+                print("Ошибка воспроизведения:", e)
+    finally:
+        audio_guard.audio_playing.clear()
+
 
 # ========================================
 # ОЗВУЧКА
 # ========================================
 
+_speech_queue = queue.Queue()
+
+
+def _speech_worker():
+    while True:
+        text = _speech_queue.get()
+        try:
+            if text is None:
+                return
+            speak_piper_sync(text)
+        finally:
+            _speech_queue.task_done()
+
+
 def speak_piper(text):
-    if not text or not os.path.exists(PIPER_PATH): return
+    """Ставит фразу в очередь — фразы не перемешиваются."""
+    if not text:
+        return
+    _speech_queue.put(text)
+
+
+def speak_piper_sync(text):
+    if not text or not os.path.exists(PIPER_PATH):
+        return
+    temp_file = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            temp_file = f.name
-        cmd = f'echo "{text}" | {PIPER_PATH} --model {PIPER_MODEL} --output_file {temp_file}'
-        subprocess.run(cmd, shell=True, capture_output=True, timeout=60)
-        with audio_lock:
-            subprocess.run(f'pw-play {temp_file}', shell=True, timeout=60)
-        os.unlink(temp_file)
-    except Exception as e: 
+        fd, temp_file = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        # текст уходит в stdin, а не в shell — кавычки и $() безопасны
+        res = subprocess.run(
+            [PIPER_PATH, "--model", PIPER_MODEL, "--output_file", temp_file],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=120,
+        )
+        if res.returncode != 0:
+            print("piper:", res.stderr.decode("utf-8", "replace")[:300])
+            return
+        # пока говорим — радио тише
+        if radio_mod.player.active():
+            radio_mod.player.duck()
+        play_wav(temp_file)
+    except Exception as e:
         print(f"Ошибка озвучки: {e}")
+    finally:
+        if radio_mod.player.active():
+            radio_mod.player.restore()
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass
+
+
+threading.Thread(target=_speech_worker, daemon=True).start()
 
 # ========================================
-# LLM (Потоковая генерация)
+# LLM (потоковая генерация)
 # ========================================
+
+
+def _iter_tokens(response, kind):
+    """Отдаёт текстовые куски из SSE (llama.cpp) или NDJSON (ollama)."""
+    for raw in response.iter_lines():
+        if not raw:
+            continue
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "error" in chunk:
+            raise RuntimeError(str(chunk["error"])[:200])
+        if kind == "completion":
+            piece = chunk.get("content") or ""
+        elif kind == "openai":
+            choices = chunk.get("choices") or []
+            piece = ""
+            if choices:
+                piece = (choices[0].get("delta") or {}).get("content") or ""
+        else:
+            piece = (chunk.get("message") or {}).get("content") or ""
+        if piece:
+            yield piece
+
+
+def _strip_think(pieces):
+    """Убирает <think>…</think> и служебные токены из потока."""
+    buf = ""
+    inside = False
+    for piece in pieces:
+        buf += piece
+        while True:
+            if inside:
+                idx = buf.find("</think>")
+                if idx == -1:
+                    buf = buf[-8:]
+                    break
+                buf = buf[idx + 8:]
+                inside = False
+                continue
+            idx = buf.find("<think>")
+            if idx == -1:
+                keep = 8
+                if len(buf) > keep:
+                    safe = buf[:-keep]
+                    for token in ("<|im_end|>", "<|im_start|>", "</think>"):
+                        safe = safe.replace(token, "")
+                    if safe:
+                        yield safe
+                    buf = buf[-keep:]
+                break
+            if idx > 0:
+                yield buf[:idx]
+            buf = buf[idx + 7:]
+            inside = True
+    if buf and not inside:
+        for token in ("<|im_end|>", "<|im_start|>", "<think>", "</think>"):
+            buf = buf.replace(token, "")
+        if buf:
+            yield buf
+
+
+def _chatml(messages):
+    """ChatML-промпт из истории: Bonsai обучена на этом формате.
+
+    Пустой закрытый <think> в конце отключает «рассуждения» и экономит время.
+    """
+    parts = []
+    for message in messages:
+        parts.append(f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n<think>\n</think>\n")
+    return "".join(parts)
+
+
+def _build_payload(provider, messages):
+    kind = provider["kind"]
+    max_tokens = provider.get("max_tokens", 200)
+    if kind == "completion":
+        return {
+            "prompt": _chatml(messages),
+            "n_predict": max_tokens,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "repeat_penalty": 1.15,
+            # "\n\n" в стопах обрывал ответ на первом пустом переводе строки
+            "stop": ["<|im_end|>", "<|im_start|>"],
+            "stream": True,
+        }
+    if kind == "ollama":
+        return {
+            "model": provider["model"],
+            "messages": messages,
+            "stream": True,
+            "options": {"num_predict": max_tokens, "temperature": 0.5},
+        }
+    return {
+        "messages": messages,
+        "stream": True,
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+    }
+
 
 def ask_llm_streaming(command, ui_ref):
-    global is_generating
+    global is_generating, pending_followup
     is_generating = True
-    
-    messages = [
-        {"role": "system", "content": "Ты — ЧайОК, голосовой помощник. Отвечай кратко и по-русски. ВАЖНО: Никогда не пиши даты в формате ГГГГ-ММ-ДД. Если называешь дату, всегда пиши её словами. Не шути про чай."},
-        {"role": "user", "content": command}
-    ]
-
-    urls_to_try = [
-        (SERVER_OLLAMA_URL, SERVER_OLLAMA_MODEL, "Сервер (ПК)"),
-        (LOCAL_OLLAMA_URL, LOCAL_OLLAMA_MODEL, "Локально (Pi)")
-    ]
-
-    response = None
-    for url, model, name in urls_to_try:
-        try:
-            payload = {"model": model, "messages": messages, "stream": True}
-            r = requests.post(url, json=payload, stream=True, timeout=10)
-            if r.status_code == 200:
-                print(f"[LLM] {name}")
-                response = r
-                break
-        except Exception as e:
-            print(f"[LLM] {name} недоступен: {e}")
-
-    if not response:
-        ui_ref.response = "Ошибка: нейросеть недоступна."
-        is_generating = False
-        return
-
+    ui_ref.status = "Generating..."
+    dialogue_history.append({"role": "user", "content": command})
+    messages = ([{"role": "system", "content": LLM_SYSTEM_PROMPT}]
+                + dialogue_history[-HISTORY_LIMIT * 2:])
+    ui_ref.response = ""
     full_text = ""
     sentence_buffer = ""
-    
-    ui_ref.response = ""
-    ui_ref.status = "Generating..."
+    try:
+        for provider in LLM_PROVIDERS:
+            kind = provider["kind"]
+            payload = _build_payload(provider, messages)
+            try:
+                r = requests.post(provider["url"], json=payload, stream=True, timeout=LLM_TIMEOUT)
+            except Exception as e:
+                print(f"[LLM] {provider['name']} недоступен: {e}")
+                continue
+            if r.status_code != 200:
+                print(f"[LLM] {provider['name']}: HTTP {r.status_code}")
+                r.close()
+                continue
 
-    for line in response.iter_lines():
-        if not line: continue
-        try:
-            chunk = json.loads(line.decode('utf-8'))
-            if "message" in chunk and "content" in chunk["message"]:
-                token = chunk["message"]["content"]
-                full_text += token
-                sentence_buffer += token
-                ui_ref.response = full_text
+            print(f"[LLM] {provider['name']}")
+            try:
+                for piece in _strip_think(_iter_tokens(r, kind)):
+                    full_text += piece
+                    sentence_buffer += piece
+                    ui_ref.response = full_text.strip()
+                    if re.search(r"[.!?…\n]", piece) and len(sentence_buffer.strip()) > 4:
+                        speak_piper(sentence_buffer.strip())
+                        sentence_buffer = ""
+            finally:
+                r.close()
 
-                if any(p in token for p in ['.', '!', '?', '\n']) and len(sentence_buffer.strip()) > 5:
-                    clean_sentence = sentence_buffer.strip()
-                    threading.Thread(target=speak_piper, args=(clean_sentence,), daemon=True).start()
-                    sentence_buffer = ""
-        except Exception: pass
+            if full_text.strip():
+                break
+            print(f"[LLM] {provider['name']}: пустой ответ")
 
-    if sentence_buffer.strip():
-        threading.Thread(target=speak_piper, args=(sentence_buffer.strip(),), daemon=True).start()
+        if sentence_buffer.strip():
+            speak_piper(sentence_buffer.strip())
+        answer = full_text.strip()
+        if answer:
+            dialogue_history.append({"role": "assistant", "content": answer})
+            del dialogue_history[:-HISTORY_LIMIT * 2]
+        else:
+            ui_ref.response = "Ошибка: нейросеть недоступна."
+            speak_piper("Извините, нейросеть недоступна.")
+            dialogue_history.pop()
+    except Exception as e:
+        print("[LLM] ошибка:", e)
+        ui_ref.response = full_text.strip() or "Ошибка: нейросеть недоступна."
+        if dialogue_history and dialogue_history[-1]["role"] == "user":
+            dialogue_history.pop()
+    finally:
+        ui_ref.status = "Ready"
+        is_generating = False
+        pending_followup = True
 
-    ui_ref.status = "Ready"
-    is_generating = False
 
 # ========================================
 # КОМАНДЫ
@@ -426,49 +776,223 @@ def ask_llm_streaming(command, ui_ref):
 
 custom_commands = load_custom_commands()
 
+RADIO_STOPWORDS = {"радио", "fm", "фм"}
+
+
+def _norm_ru(text):
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[^а-яa-z0-9 ]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def find_station_index(command, stations):
+    """Станция по фразе-алиасу, затем по основе слова.
+
+    Приоритет: точная фраза («ретро хит») важнее отдельного слова («ретро»),
+    при равенстве выигрывает станция, стоящая выше в списке.
+    Основа слова нужна для падежей: «дискотеку» → «дискотека».
+    """
+    normalized_cmd = _norm_ru(command)
+    cmd = f" {normalized_cmd} "
+    words = normalized_cmd.split()
+    best = None
+
+    for index, station in enumerate(stations):
+        keys = [station["name"]] + list(station.get("aliases", []))
+        for key in keys:
+            normalized = _norm_ru(key)
+            if not normalized:
+                continue
+            candidate = None
+            if " " in normalized and f" {normalized} " in cmd:
+                candidate = (2, len(normalized), -index)
+            else:
+                for word in normalized.split():
+                    if word in RADIO_STOPWORDS:
+                        continue
+                    if word.isdigit():
+                        if word in words:
+                            candidate = (1, len(word), -index)
+                            break
+                        continue
+                    if len(word) < 3:
+                        continue
+                    stem = word[:5]
+                    if any(w.startswith(stem) for w in words):
+                        candidate = (1, len(word), -index)
+                        break
+            if candidate and (best is None or candidate > best):
+                best = candidate
+
+    return -best[2] if best else None
+
+
+def _set_volume(value):
+    value = max(0.0, min(1.0, value))
+    volume.save(value)
+    if radio_mod.player.active():
+        radio_mod.player.set_volume(value)
+    return volume.describe()
+
+
+def handle_volume_command(command):
+    if any(phrase in command for phrase in ("выключи звук", "без звука", "тишина")):
+        return _set_volume(0.0)
+    if "на всю" in command or "максимальн" in command:
+        return _set_volume(1.0)
+    if "тише" in command or "потише" in command:
+        return _set_volume(volume.load() - 0.1)
+    if "громче" in command or "погромче" in command:
+        return _set_volume(volume.load() + 0.1)
+    if "громкость" in command or "звук" in command:
+        numbers = re.findall(r"\d+", command)
+        if numbers:
+            return _set_volume(int(numbers[0]) / 100.0)
+        return volume.describe()
+    return None
+
+
+def handle_radio_command(command):
+    player = radio_mod.player
+
+    if any(word in command for word in ("выключи", "отключи", "стоп", "хватит")):
+        if player.active():
+            return player.stop()
+        return None
+
+    if "радио" not in command and "станц" not in command:
+        return None
+
+    if "следующ" in command or "переключ" in command:
+        name = player.next_station()
+        return f"Станция: {name}" if name else "Не удалось переключить"
+
+    index = find_station_index(command, player.stations)
+    if index is not None:
+        name = player.start(index)
+        return f"Включаю {name}" if name else "Не удалось включить радио"
+
+    if player.active():
+        return f"Уже играет {player.station_name()}"
+    name = player.start()
+    return f"Включаю {name}" if name else "Не удалось включить радио"
+
+
+def _plural(value, one, few, many):
+    n = abs(int(value)) % 100
+    if 11 <= n <= 19:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    if 2 <= n <= 4:
+        return few
+    return many
+
+
+def handle_timer_command(command):
+    if "таймер" not in command and "напомни" not in command and "напоминание" not in command:
+        return None
+
+    if any(word in command for word in ("выключи", "отмени", "стоп", "хватит", "убери")):
+        return timer_mod.stop()
+
+    if "сколько" in command or "осталось" in command:
+        return timer_mod.describe() or "Таймер не запущен"
+
+    numbers = re.findall(r"\d+", command)
+    if not numbers:
+        return "Скажи, на сколько: например, таймер на 5 минут"
+
+    value = int(numbers[0])
+    if "час" in command:
+        unit, word = 3600, _plural(value, "час", "часа", "часов")
+    elif "секунд" in command:
+        unit, word = 1, _plural(value, "секунду", "секунды", "секунд")
+    else:
+        unit, word = 60, _plural(value, "минуту", "минуты", "минут")
+
+    seconds = value * unit
+    if seconds <= 0 or seconds > 24 * 3600:
+        return "Такой таймер не поставлю"
+
+    timer_mod.start(seconds, command)
+    return f"Таймер на {value} {word}"
+
+
 def process_command(command):
     command = command.lower().strip()
 
+    if any(phrase in command for phrase in
+           ("забудь всё", "забудь все", "очисти контекст", "новый разговор", "начнём заново")):
+        dialogue_history.clear()
+        return "Контекст очищен", None
+
+    if timer_mod.is_ringing() and command in ("стоп", "хватит", "замолчи", "выключи"):
+        return timer_mod.stop(), None
+
+    timer_response = handle_timer_command(command)
+    if timer_response:
+        return timer_response, None
+
+    if radio_mod.player.active() and command in ("стоп", "хватит", "замолчи", "выключи"):
+        return radio_mod.player.stop(), None
+
+    volume_response = handle_volume_command(command)
+    if volume_response:
+        return volume_response, None
+
+    radio_response = handle_radio_command(command)
+    if radio_response:
+        return radio_response, None
+
     if "погода" in command and "прогноз" not in command:
         w = get_weather_now()
-        if "Ошибка" in w: return f"Ошибка: {w['Ошибка']}", w
-        text = f"Сейчас в Москве {w['Температура']}, {w['Погода']}. Ощущается как {w['Ощущается']}. Влажность {w['Влажность']}, ветер {w['Ветер']}."
+        if "Ошибка" in w:
+            return f"Ошибка: {w['Ошибка']}", w
+        text = (f"Сейчас в Москве {w['Температура']}, {w['Погода']}. "
+                f"Ощущается как {w['Ощущается']}. Влажность {w['Влажность']}, ветер {w['Ветер']}.")
         return text, w
 
     if "прогноз" in command:
         days = 7 if "недел" in command or "7" in command else 3
         w = get_weather_forecast(days=days)
-        if "Ошибка" in w: return f"Ошибка: {w['Ошибка']}", w
+        if "Ошибка" in w:
+            return f"Ошибка: {w['Ошибка']}", w
         text = f"Прогноз на {days} дней:\n"
-        for date, info in w.items(): text += f"{date}: {info}\n"
+        for date, info in w.items():
+            text += f"{date}: {info}\n"
         return text, w
 
     alarm_response = alarm.process_alarm_command(command)
-    if alarm_response: return alarm_response, None
+    if alarm_response:
+        return alarm_response, None
 
     addition_response = addition.process_addition_command(command)
-    if addition_response: return addition_response, None
+    if addition_response:
+        return addition_response, None
 
     if "редактор" in command or "скрипт" in command:
         threading.Thread(target=open_script_editor, daemon=True).start()
         return "Открываю редактор.", None
 
-    if "радио" in command:
-        threading.Thread(target=open_radio_editor, daemon=True).start()
-        return "Открываю радио.", None
-
-    for cmd in custom_commands:
-        if cmd.lower() in command: return f"Выполнено: {cmd}", None
+    executed = run_custom_command(command)
+    if executed:
+        return f"Выполнено: {executed}", None
 
     return None, None
+
 
 # ========================================
 # ГОЛОС
 # ========================================
 
+
 class VoiceEngine:
     def __init__(self, model_path):
-        if not os.path.exists(model_path): sys.exit(1)
+        if not os.path.exists(model_path):
+            print(f"Модель Vosk не найдена: {model_path}", file=sys.stderr)
+            sys.exit(1)
         vosk.SetLogLevel(-1)
         self.model = vosk.Model(model_path)
         self.recognizer = vosk.KaldiRecognizer(self.model, AUDIO_RATE)
@@ -478,34 +1002,67 @@ class VoiceEngine:
         self.state = "waiting"
         self.last_text_time = 0
         self.process = None
+        self._muted = False
         self._start_arecord()
         threading.Thread(target=self._listen_loop, daemon=True).start()
 
     def _start_arecord(self):
-        cmd = ["arecord", "-D", f"plughw:{MIC_CARD},{MIC_DEVICE}", "-f", "S16_LE", "-r", str(AUDIO_RATE), "-c", str(AUDIO_CHANNELS), "-t", "raw", "-q"]
-        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**6)
-        print(f"Микрофон: plughw:{MIC_CARD},{MIC_DEVICE}")
+        device = get_mic_device()
+        cmd = ["arecord", "-D", device, "-f", "S16_LE", "-r", str(AUDIO_RATE),
+               "-c", str(AUDIO_CHANNELS), "-t", "raw", "-q"]
+        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, bufsize=10 ** 6)
+        print(f"Микрофон: {device}")
 
-    def _is_wake_word(self, text): return any(w in text for w in WAKE_WORDS)
+    def _is_wake_word(self, text):
+        return any(w in text for w in WAKE_WORDS)
+
+    def _start_listening(self):
+        global followup_until
+        self.state = "listening"
+        self.wake_detected = True
+        self.command_text = ""
+        self.last_text_time = time.time()
+        followup_until = 0.0
+        # пока ждём команду, радио приглушается
+        if radio_mod.player.active():
+            radio_mod.player.duck()
+
+    def _in_followup(self, text):
+        """Окно после ответа: слушаем уточнение без слова-активатора."""
+        return bool(text) and time.time() < followup_until
 
     def _listen_loop(self):
         while self.running:
-            if is_generating:
+            if not self.process or not self.process.stdout:
                 time.sleep(0.1)
                 continue
             data = self.process.stdout.read(AUDIO_CHUNK)
             if not data:
                 time.sleep(0.05)
                 continue
+
+            # поток читаем всегда (иначе ALSA захлёбывается), но пока говорим
+            # сами — кадры в распознавание не отдаём
+            muted = audio_guard.audio_playing.is_set() or is_generating
+            if muted:
+                if not self._muted:
+                    self._muted = True
+                    self.recognizer.Reset()
+                    self.command_text = ""
+                    self.state = "waiting"
+                    self.wake_detected = False
+                continue
+            if self._muted:
+                self._muted = False
+                self.recognizer.Reset()
+
             if self.recognizer.AcceptWaveform(data):
                 res = json.loads(self.recognizer.Result())
                 text = res.get("text", "").lower()
                 if self.state == "waiting":
-                    if self._is_wake_word(text):
-                        self.state = "listening"
-                        self.wake_detected = True
-                        self.command_text = ""
-                        self.last_text_time = time.time()
+                    if self._is_wake_word(text) or self._in_followup(text):
+                        self._start_listening()
                 elif self.state == "listening":
                     if text:
                         self.command_text += " " + text
@@ -515,10 +1072,7 @@ class VoiceEngine:
                 pt = part.get("partial", "").lower()
                 if pt:
                     if self.state == "waiting" and self._is_wake_word(pt):
-                        self.state = "listening"
-                        self.wake_detected = True
-                        self.command_text = ""
-                        self.last_text_time = time.time()
+                        self._start_listening()
                     elif self.state == "listening":
                         self.last_text_time = time.time()
 
@@ -531,11 +1085,12 @@ class VoiceEngine:
             cmd = self.command_text.strip().lower()
             self.command_text = ""
             self.state = "waiting"
-            
             for word in WAKE_WORDS:
                 cmd = cmd.replace(word, "").strip()
-                
-            if not cmd: return "привет"
+            if radio_mod.player.active():
+                radio_mod.player.restore()
+            if not cmd:
+                return "привет"
             return cmd
         return None
 
@@ -547,11 +1102,48 @@ class VoiceEngine:
 
     def close(self):
         self.running = False
-        if self.process: self.process.terminate()
+        if self.process:
+            try:
+                self.process.terminate()
+            except Exception:
+                pass
+
 
 # ========================================
 # ИНТЕРФЕЙС
 # ========================================
+
+_logo_cache = None
+
+
+def get_logo():
+    global _logo_cache
+    if _logo_cache is None:
+        try:
+            _logo_cache = pygame.transform.scale(
+                pygame.image.load(os.path.join(PROJECT_DIR, "logo.png")), (50, 50)
+            )
+        except Exception:
+            _logo_cache = False
+    return _logo_cache
+
+
+def wrap_text(text, font, max_width):
+    words = text.replace("\n", " ").split(" ")
+    lines = []
+    current = ""
+    for word in words:
+        test = current + word + " "
+        if font.size(test)[0] < max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current.strip())
+            current = word + " "
+    if current:
+        lines.append(current.strip())
+    return lines
+
 
 class ChayOKUI:
     def __init__(self):
@@ -561,28 +1153,33 @@ class ChayOKUI:
         self.weather_data = None
         self.show_buttons = True
         self.alarm_active = False
+        self.timer_active = False
         self.alarm_stop_rect = None
         self.setup_buttons()
         self.voice = None
 
     def setup_buttons(self):
-        # Уменьшили ширину, чтобы влезло 7 кнопок
-        btn_w, btn_h, spacing = 95, 45, 6
-        y = SCREEN_HEIGHT - 100
+        btn_w, btn_h, spacing = 105, 45, 6
+        y = 360
         button_defs = [
-            ("Привет", "привет"), 
-            ("Погода", "погода"), 
-            ("Прогноз", "прогноз на неделю"), 
-            ("Будильник", "__alarm_editor__"), 
-            ("Радио", "__radio_editor__"),  # Новая кнопка
-            ("Редактор", "редактор"), 
-            ("Выкл", "__shutdown__")
+            ("Привет", "привет"),
+            ("Погода", "погода"),
+            ("Прогноз", "прогноз на неделю"),
+            ("Радио", "__radio__"),
+            ("Будильник", "__alarm_editor__"),
+            ("Редактор", "редактор"),
+            ("Выключить", "__shutdown__"),
         ]
         total_w = len(button_defs) * (btn_w + spacing) - spacing
         start_x = (SCREEN_WIDTH - total_w) // 2
         self.buttons = []
         for i, (label, command) in enumerate(button_defs):
-            self.buttons.append({"rect": pygame.Rect(start_x + i * (btn_w + spacing), y, btn_w, btn_h), "label": label, "command": command, "hover": False})
+            self.buttons.append({
+                "rect": pygame.Rect(start_x + i * (btn_w + spacing), y, btn_w, btn_h),
+                "label": label,
+                "command": command,
+                "hover": False,
+            })
 
     def show_alarm(self, level, label):
         self.alarm_active = True
@@ -592,19 +1189,38 @@ class ChayOKUI:
         self.show_buttons = False
         self.update_display_alarm()
 
-    def update_display_alarm(self):
+    def _draw_stop_screen(self, status_text):
         screen.fill(COLORS["bg"])
         screen.blit(font_title.render("[ ChayOK ]", True, COLORS["primary"]), (30, 20))
-        screen.blit(font_status.render(self.status, True, COLORS["error"]), (30, 110))
-        btn_rect = pygame.Rect(SCREEN_WIDTH//2 - 150, SCREEN_HEIGHT//2 + 30, 300, 80)
+        screen.blit(font_status.render(status_text, True, COLORS["error"]), (30, 110))
+        sub = font_small.render("Скажи «стоп» или нажми кнопку", True, COLORS["text_dim"])
+        screen.blit(sub, (30, 160))
+        btn_rect = pygame.Rect(SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT // 2 + 30, 300, 80)
         draw_rounded_rect(screen, (200, 30, 30), btn_rect, radius=12)
         btn_text = font_title.render("СТОП", True, (255, 255, 255))
         screen.blit(btn_text, btn_text.get_rect(center=btn_rect.center))
         self.alarm_stop_rect = btn_rect
         pygame.display.flip()
 
+    def update_display_alarm(self):
+        self._draw_stop_screen(self.status)
+
+    def show_timer(self):
+        if not self.timer_active:
+            self.timer_active = True
+            self.show_buttons = False
+        self._draw_stop_screen("ТАЙМЕР: время вышло")
+
     def handle_click(self, pos):
         global is_generating
+        if self.timer_active and self.alarm_stop_rect and self.alarm_stop_rect.collidepoint(pos):
+            timer_mod.stop()
+            self.timer_active = False
+            self.show_buttons = True
+            self.status = "Ready"
+            self.response = "Таймер выключен"
+            self.update_display()
+            return True
         if self.alarm_active and self.alarm_stop_rect and self.alarm_stop_rect.collidepoint(pos):
             alarm.stop_alarm()
             self.alarm_active = False
@@ -619,14 +1235,18 @@ class ChayOKUI:
                     if btn["command"] == "__alarm_editor__":
                         threading.Thread(target=open_alarm_editor, daemon=True).start()
                         self.response = "Открываю редактор будильника."
-                    elif btn["command"] == "__radio_editor__":
-                        threading.Thread(target=open_radio_editor, daemon=True).start()
-                        self.response = "Открываю радио."
+                    elif btn["command"] == "__radio__":
+                        if radio_mod.player.active():
+                            self.response = radio_mod.player.stop()
+                        else:
+                            name = radio_mod.player.start()
+                            self.response = f"Радио: {name}" if name else "Не удалось включить радио"
+                        self.update_display()
                     elif btn["command"] == "__shutdown__":
                         self.response = "Выключаю..."
                         self.update_display()
-                        speak_piper("Выключаю")
-                        time.sleep(2)
+                        speak_piper_sync("Выключаю")
+                        time.sleep(1)
                         subprocess.run(["sudo", "shutdown", "-h", "now"])
                         pygame.quit()
                         sys.exit(0)
@@ -637,17 +1257,19 @@ class ChayOKUI:
 
     def execute_command(self, command):
         global is_generating
+        if is_generating:
+            return
         self.status = "Thinking..."
         self.update_display()
-        
+
         response, weather = process_command(command)
-        
+
         if response is not None:
             self.response = response
             self.status = "Response:"
             self.weather_data = weather
             self.update_display()
-            threading.Thread(target=speak_piper, args=(response,), daemon=True).start()
+            speak_piper(response)
         else:
             self.weather_data = None
             threading.Thread(target=ask_llm_streaming, args=(command, self), daemon=True).start()
@@ -659,56 +1281,82 @@ class ChayOKUI:
 
     def update_display(self):
         screen.fill(COLORS["bg"])
-        try:
-            logo = pygame.image.load(os.path.join(BASE_DIR, "ChayOK/logo.png"))
-            screen.blit(pygame.transform.scale(logo, (50, 50)), (SCREEN_WIDTH - 70, SCREEN_HEIGHT - 70))
-        except: pass
-        
-        draw_glow_line(screen, COLORS["primary"], (30, 85), (SCREEN_WIDTH - 30, 85), 2)
-        draw_glow_line(screen, COLORS["secondary"], (30, 90), (SCREEN_WIDTH - 30, 90), 1)
-        screen.blit(font_title.render("[ ChayOK ]", True, COLORS["primary"]), (30, 20))
-        status_col = COLORS["salad"] if "Ready" in self.status else COLORS["accent"] if "Thinking" in self.status else COLORS["text"]
-        screen.blit(font_status.render(self.status, True, status_col), (30, 110))
-        
+        logo = get_logo()
+        if logo:
+            screen.blit(logo, (SCREEN_WIDTH - 70, SCREEN_HEIGHT - 70))
+
+        now = datetime.datetime.now()
+        clock = font_clock.render(now.strftime("%H:%M"), True, COLORS["primary"])
+        screen.blit(clock, (SCREEN_WIDTH - 30 - clock.get_width(), 6))
+        date_text = f"{WEEKDAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]}"
+        rendered_date = font_tiny.render(date_text, True, COLORS["text_dim"])
+        screen.blit(rendered_date, (SCREEN_WIDTH - 30 - rendered_date.get_width(), 54))
+
+        draw_glow_line(screen, COLORS["primary"], (30, 80), (SCREEN_WIDTH - 30, 80), 2)
+        draw_glow_line(screen, COLORS["secondary"], (30, 85), (SCREEN_WIDTH - 30, 85), 1)
+        screen.blit(font_title.render("[ ChayOK ]", True, COLORS["primary"]), (30, 12))
+        if "Ready" in self.status:
+            status_col = COLORS["salad"]
+        elif "Thinking" in self.status or "Generating" in self.status:
+            status_col = COLORS["accent"]
+        elif "Listening" in self.status:
+            status_col = COLORS["secondary"]
+        else:
+            status_col = COLORS["text"]
+        screen.blit(font_status.render(self.status, True, status_col), (30, 88))
+
+        alarm_data = cached_alarm()
+        if alarm_data.get("enabled"):
+            alarm_txt = f"Будильник {alarm_data['hour']:02d}:{alarm_data['minute']:02d}"
+        else:
+            alarm_txt = "Будильник выкл"
+        info_parts = [alarm_txt, f"Звук {volume.percent()}%"]
+        if radio_mod.player.active():
+            info_parts.insert(0, f"Радио: {radio_mod.player.station_name()}")
+        timer_text = timer_mod.describe()
+        if timer_text:
+            info_parts.insert(0, timer_text)
+        screen.blit(font_tiny.render(" · ".join(info_parts), True, COLORS["text_dim"]), (30, 128))
+
+        card_w = SCREEN_WIDTH - 60
+        if self.weather_data and "Ошибка" not in self.weather_data:
+            card_w = SCREEN_WIDTH - 320
+
         if self.response:
-            card = pygame.Rect(30, 180, SCREEN_WIDTH - 60, 200)
+            card = pygame.Rect(30, 150, card_w, 198)
             draw_rounded_rect(screen, COLORS["card_bg"], card, radius=8)
-            draw_rounded_rect(screen, COLORS["border"], card, radius=8, border_width=1, border_color=COLORS["border"])
-            
-            words = self.response.replace('\n', ' ').split(' ')
-            lines = []
-            current_line = ""
-            max_width = SCREEN_WIDTH - 100
-            for word in words:
-                test_line = current_line + word + " "
-                if font_text.size(test_line)[0] < max_width:
-                    current_line = test_line
-                else:
-                    if current_line: lines.append(current_line.strip())
-                    current_line = word + " "
-            if current_line: lines.append(current_line.strip())
-            
-            y = 200
-            for line in lines[-6:]:
+            # только контур: draw_rounded_rect всегда заливает цветом
+            pygame.draw.rect(screen, COLORS["border"], card, 1, border_radius=8)
+            lines = wrap_text(self.response, font_text, card_w - 40)
+            y = 168
+            max_lines = (card.height - 36) // 30
+            shown = lines[-max_lines:]
+            if len(lines) > max_lines:
+                shown[0] = "… " + shown[0]
+            for line in shown:
                 screen.blit(font_text.render(line, True, COLORS["text"]), (50, y))
                 y += 30
 
         if self.weather_data and "Ошибка" not in self.weather_data:
-            wx, wy = SCREEN_WIDTH - 280, 120
-            draw_rounded_rect(screen, COLORS["salad"], (wx, wy, 250, 320), radius=8)
-            y_offset = wy + 10
-            for k, v in list(self.weather_data.items())[:8]:
-                screen.blit(font_small.render(f"{k}: {v}", True, (0, 0, 60)), (wx + 10, y_offset))
-                y_offset += 25
-                
-        draw_glow_line(screen, COLORS["primary"], (30, SCREEN_HEIGHT - 50), (SCREEN_WIDTH - 30, SCREEN_HEIGHT - 50), 1)
-        if self.subtext: screen.blit(font_small.render(self.subtext, True, COLORS["text_dim"]), (30, SCREEN_HEIGHT - 40))
+            wx, wy = SCREEN_WIDTH - 280, 150
+            draw_rounded_rect(screen, COLORS["salad"], (wx, wy, 250, 190), radius=8)
+            y_offset = wy + 8
+            for k, v in list(self.weather_data.items())[:7]:
+                screen.blit(font_tiny.render(f"{k}: {v}", True, (0, 0, 60)), (wx + 10, y_offset))
+                y_offset += 24
+
+        draw_glow_line(screen, COLORS["primary"], (30, 416), (SCREEN_WIDTH - 30, 416), 1)
+        if self.subtext:
+            screen.blit(font_small.render(self.subtext, True, COLORS["text_dim"]), (30, 432))
         bat_level = get_battery_level()
         if bat_level is not None:
-            bat_color = COLORS["salad"] if bat_level > 60 else COLORS["accent"] if bat_level > 30 else COLORS["error"]
-            screen.blit(font_small.render(f"Battery: {bat_level}%", True, bat_color), (SCREEN_WIDTH // 2 - 40, SCREEN_HEIGHT - 40))
+            bat_color = (COLORS["salad"] if bat_level > 60
+                         else COLORS["accent"] if bat_level > 30 else COLORS["error"])
+            bat_text = font_small.render(f"Battery: {bat_level}%", True, bat_color)
         else:
-            screen.blit(font_small.render("Battery: --%", True, COLORS["text_dim"]), (SCREEN_WIDTH // 2 - 40, SCREEN_HEIGHT - 40))
+            bat_text = font_small.render("Battery: --%", True, COLORS["text_dim"])
+        # справа, чтобы не наезжать на подпись и логотип
+        screen.blit(bat_text, (SCREEN_WIDTH - 240, 432))
         if self.show_buttons:
             mouse_pos = pygame.mouse.get_pos()
             for btn in self.buttons:
@@ -718,59 +1366,139 @@ class ChayOKUI:
                 screen.blit(btn_text, btn_text.get_rect(center=btn["rect"].center))
         pygame.display.flip()
 
+
 # ========================================
 # ГЛАВНАЯ
 # ========================================
 
 ui = None
 
+
+def install_crash_hook():
+    """Необработанное исключение — письмо, а не тихая смерть."""
+    def hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        notifier.notify("ЧайОК: ошибка", text[-2500:], key="crash")
+        notifier.flush(4)
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
+
+
 def alarm_ui_callback(level, label):
     global alarm_pending
     alarm_pending = (level, label)
 
+
+def install_signal_handlers():
+    """SIGTERM от systemd — штатная остановка, а не тихая смерть."""
+    def handler(signum, frame):
+        notifier.notify(
+            "ЧайОК остановлен",
+            f"Получен сигнал {signum}, приложение завершается.\n"
+            f"Время: {time.strftime('%d.%m.%Y %H:%M:%S')}",
+            key="stop",
+        )
+        notifier.flush(4)
+        try:
+            radio_mod.player.stop()
+        except Exception:
+            pass
+        pygame.quit()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handler)
+
+
 def main():
-    global ui, custom_commands, alarm_pending
-    os.makedirs(os.path.join(BASE_DIR, "ChayOK"), exist_ok=True)
-    os.makedirs(os.path.join(BASE_DIR, "ChayOK/sounds"), exist_ok=True)
+    global ui, custom_commands, alarm_pending, followup_until, pending_followup
+    install_crash_hook()
+    install_signal_handlers()
+    os.makedirs(PROJECT_DIR, exist_ok=True)
+    os.makedirs(os.path.join(PROJECT_DIR, "sounds"), exist_ok=True)
     custom_commands = load_custom_commands()
-    if not os.path.exists(os.path.join(BASE_DIR, "ChayOK/custom_commands.json")):
+    if not os.path.exists(commands_path()):
         save_custom_commands(["включи свет", "выключи свет"])
-        
+
+    notifier.notify(
+        "ЧайОК запущен",
+        f"Устройство: {os.uname().nodename}\n"
+        f"Время: {time.strftime('%d.%m.%Y %H:%M:%S')}\n"
+        f"Модель LLM: {LLM_PROVIDERS[0]['name']}",
+        key="start",
+    )
+    watchdog.start()
+
     ui = ChayOKUI()
     ui.update_display()
     threading.Thread(target=alarm.alarm_checker, args=(alarm_ui_callback,), daemon=True).start()
-    
+
     voice = VoiceEngine(VOSK_MODEL_PATH)
     ui.voice = voice
     print("Микрофон готов")
     ui.update_status("Ready", "Скажи 'ЧайОК' или нажми кнопку")
-    
+
     running = True
     try:
         while running:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT: running = False
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1: ui.handle_click(event.pos)
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: running = False
-            
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    ui.handle_click(event.pos)
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
+
             if alarm_pending is not None:
                 level, label = alarm_pending
                 alarm_pending = None
                 ui.show_alarm(level, label)
-                
+
+            if timer_mod.is_ringing():
+                ui.show_timer()
+            elif ui.timer_active:
+                ui.timer_active = False
+                ui.show_buttons = True
+                ui.status = "Ready"
+                ui.response = "Таймер выключен"
+
+            # окно продолжения открываем только после того, как договорили
+            if pending_followup and not audio_guard.audio_playing.is_set():
+                followup_until = time.time() + FOLLOWUP_SECONDS
+                pending_followup = False
+                ui.subtext = "Слушаю продолжение..."
+            elif followup_until and time.time() > followup_until:
+                followup_until = 0.0
+                pending_followup = False
+                ui.subtext = "Скажи 'ЧайОК' или нажми кнопку"
+
             if not ui.alarm_active:
-                if voice.is_wake_detected(): ui.update_status("Listening...", "Говорите...")
                 command = voice.get_command()
                 if command:
                     ui.execute_command(command)
-                    
-            ui.update_display()
+                elif not ui.timer_active and voice.is_wake_detected():
+                    ui.update_status("Listening...", "Говорите...")
+
+            if not ui.alarm_active and not ui.timer_active:
+                ui.update_display()
             time.sleep(0.05)
-    except KeyboardInterrupt: pass
+    except KeyboardInterrupt:
+        pass
     finally:
         voice.close()
+        try:
+            radio_mod.player.stop()
+        except Exception:
+            pass
+        notifier.notify(
+            "ЧайОК остановлен",
+            f"Приложение завершило работу.\nВремя: {time.strftime('%d.%m.%Y %H:%M:%S')}",
+            key="stop",
+        )
+        notifier.flush(4)
         pygame.quit()
         sys.exit(0)
+
 
 if __name__ == "__main__":
     print("ChayOK — голосовой помощник")

@@ -1,14 +1,25 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
+# виртуальное окружение и модели — ставятся локально, в репозитории им не место
 venv/
+vosk-model/
+piper/
+models/
+*.onnx
+*.gguf
 
-# Логи и временные файлы
-*.log
+# кэш
+__pycache__/
+*.pyc
+
+# логи и бэкапы
 log.txt
+*.bak
+*.zip
 
-# Системное
-.DS_Store
-Thumbs.db
+# звуки (mp3 с правами) и служебное
+sounds/*.mp3
+
+# секреты и локальное состояние
+api.txt
+notify.json
+alarm.json
+volume.json

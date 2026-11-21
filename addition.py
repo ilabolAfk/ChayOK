@@ -21,25 +21,13 @@ radio_process = None
 # ========================================
 
 def get_joke():
-    """Возвращает случайный анекдот из jokes.txt.
-    Анекдот — блок строк, разделённый пустыми строками."""
+    """Возвращает случайный анекдот из jokes.txt."""
     try:
         with open(JOKES_FILE, "r", encoding="utf-8") as f:
-            blocks = []
-            current = []
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    if current:
-                        blocks.append("\n".join(current))
-                        current = []
-                else:
-                    current.append(line)
-            if current:
-                blocks.append("\n".join(current))
-        if not blocks:
+            jokes = [line.strip() for line in f if line.strip()]
+        if not jokes:
             return "Файл с анекдотами пуст."
-        return random.choice(blocks)
+        return random.choice(jokes)
     except FileNotFoundError:
         return "Не могу найти файл с анекдотами."
     except Exception as e:
