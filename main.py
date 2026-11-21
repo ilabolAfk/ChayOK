@@ -82,7 +82,6 @@ LLM_SYSTEM_PROMPT = (
     "Никогда не пиши даты в формате ГГГГ-ММ-ДД — называй дату словами."
 )
 
-WEATHER_API_KEY = os.environ.get("CHAYOK_WEATHER_KEY", "")
 CITY = "Москва"
 
 AUDIO_RATE = 16000        # Vosk обучен на 16 кГц
@@ -381,74 +380,74 @@ def open_alarm_editor():
 # ========================================
 
 
-def weather_key():
-    if WEATHER_API_KEY:
-        return WEATHER_API_KEY
-    try:
-        with open(os.path.join(PROJECT_DIR, "api.txt"), encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+CITY_COORDS = {"latitude": 55.7558, "longitude": 37.6173}
+
+# коды WMO → по-русски
+WMO_RU = {
+    0: "ясно", 1: "в основном ясно", 2: "переменная облачность", 3: "пасмурно",
+    45: "туман", 48: "изморозь",
+    51: "слабая морось", 53: "морось", 55: "сильная морось",
+    56: "ледяная морось", 57: "сильная ледяная морось",
+    61: "небольшой дождь", 63: "дождь", 65: "сильный дождь",
+    66: "ледяной дождь", 67: "сильный ледяной дождь",
+    71: "небольшой снег", 73: "снег", 75: "сильный снег", 77: "снежная крупа",
+    80: "небольшие ливни", 81: "ливни", 82: "сильные ливни",
+    85: "небольшие снежные ливни", 86: "сильные снежные ливни",
+    95: "гроза", 96: "гроза с градом", 99: "сильная гроза с градом",
+}
+
+MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня",
+             "июля", "августа", "сентября", "октября", "ноября", "декабря"]
 
 
-def get_weather_now(city=CITY):
-    key = weather_key()
-    if not key:
-        return {"Ошибка": "API ключ не установлен"}
+def weather_desc(code):
+    return WMO_RU.get(int(code), "без осадков")
+
+
+def _weather_request(daily=None, days=1):
+    """Open-Meteo: ключ не нужен, HTTPS. OpenWeather из РФ висит на TLS."""
+    params = dict(CITY_COORDS, timezone="Europe/Moscow", forecast_days=days)
+    params["current"] = ("temperature_2m,apparent_temperature,"
+                         "relative_humidity_2m,wind_speed_10m,weather_code")
+    if daily:
+        params["daily"] = daily
+    response = requests.get(WEATHER_URL, params=params, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_weather_now():
     try:
-        url = "http://api.openweathermap.org/data/2.5/weather"
-        r = requests.get(url, params={"q": city, "appid": key, "units": "metric", "lang": "ru"}, timeout=10)
-        if r.status_code == 200:
-            d = r.json()
-            temperature = round(d["main"]["temp"])
-            feels = round(d["main"]["feels_like"])
-            return {
-                "Температура": f"{temperature} {_plural(temperature, 'градус', 'градуса', 'градусов')}",
-                "Ощущается": f"{feels} {_plural(feels, 'градус', 'градуса', 'градусов')}",
-                "Погода": d["weather"][0]["description"],
-                "Влажность": f"{d['main']['humidity']}%",
-                "Ветер": f"{d['wind']['speed']} м/с",
-            }
-        return {"Ошибка": f"Код {r.status_code}"}
+        current = _weather_request()["current"]
+        temperature = round(current["temperature_2m"])
+        feels = round(current["apparent_temperature"])
+        wind = round(current["wind_speed_10m"] / 3.6, 1)  # км/ч → м/с
+        return {
+            "Температура": f"{temperature} {_plural(temperature, 'градус', 'градуса', 'градусов')}",
+            "Ощущается": f"{feels} {_plural(feels, 'градус', 'градуса', 'градусов')}",
+            "Погода": weather_desc(current["weather_code"]),
+            "Влажность": f"{current['relative_humidity_2m']}%",
+            "Ветер": f"{wind} м/с",
+        }
     except Exception as e:
         return {"Ошибка": str(e)}
 
 
-def get_weather_forecast(city=CITY, days=7):
-    key = weather_key()
-    if not key:
-        return {"Ошибка": "API ключ не установлен"}
+def get_weather_forecast(days=7):
     try:
-        url = "http://api.openweathermap.org/data/2.5/forecast"
-        r = requests.get(url, params={"q": city, "appid": key, "units": "metric", "lang": "ru"}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            result = {}
-            seen = set()
-            months = ["января", "февраля", "марта", "апреля", "мая", "июня",
-                      "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-            for item in data["list"]:
-                date_iso = item["dt_txt"][:10]
-                if date_iso in seen:
-                    continue
-                if item["dt_txt"][11:16] == "12:00" or not result:
-                    dt = datetime.datetime.strptime(date_iso, "%Y-%m-%d")
-                    date_ru = f"{dt.day} {months[dt.month - 1]}"
-                    temp = round(item["main"]["temp"])
-                    result[date_ru] = (f"{temp} {_plural(temp, 'градус', 'градуса', 'градусов')}, "
-                                       f"{item['weather'][0]['description']}")
-                    seen.add(date_iso)
-                if len(result) >= days:
-                    break
-            return result
-        return {"Ошибка": f"Код {r.status_code}"}
+        daily = _weather_request(daily="weather_code,temperature_2m_max", days=days)["daily"]
+        result = {}
+        for index, iso in enumerate(daily["time"][:days]):
+            dt = datetime.datetime.strptime(iso, "%Y-%m-%d")
+            date_ru = f"{dt.day} {MONTHS_RU[dt.month - 1]}"
+            temperature = round(daily["temperature_2m_max"][index])
+            result[date_ru] = (f"днём {temperature} "
+                               f"{_plural(temperature, 'градус', 'градуса', 'градусов')}, "
+                               f"{weather_desc(daily['weather_code'][index])}")
+        return result
     except Exception as e:
         return {"Ошибка": str(e)}
-
-
-def datetime_strptime(date_iso):
-    import datetime
-    return datetime.datetime.strptime(date_iso, "%Y-%m-%d")
 
 
 # ========================================
