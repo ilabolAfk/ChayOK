@@ -65,6 +65,77 @@ def _status():
     return result
 
 
+_prev_cpu = None
+
+
+def _cpu_percent():
+    """Загрузка ЦП по дельте /proc/stat между запросами."""
+    global _prev_cpu
+    try:
+        with open("/proc/stat") as handle:
+            parts = [int(x) for x in handle.readline().split()[1:9]]
+    except Exception:
+        return 0.0
+    idle = parts[3] + parts[4]
+    total = sum(parts)
+    prev, _prev_cpu = _prev_cpu, (idle, total)
+    if not prev:
+        return 0.0
+    d_idle, d_total = idle - prev[0], total - prev[1]
+    return round(100.0 * (1 - d_idle / d_total), 1) if d_total > 0 else 0.0
+
+
+def _mem_percent():
+    info = {}
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                key, *rest = line.replace(":", "").split()
+                if rest:
+                    info[key] = int(rest[0])
+    except Exception:
+        return 0.0
+    total = info.get("MemTotal", 0)
+    if not total:
+        return 0.0
+    used = total - info.get("MemAvailable", info.get("MemFree", 0))
+    return round(100.0 * used / total, 1)
+
+
+def _vcgencmd(*args):
+    try:
+        out = subprocess.run(["vcgencmd", *args], capture_output=True, text=True,
+                             timeout=2).stdout.strip()
+    except Exception:
+        return None
+    return out.split("=")[-1] if "=" in out else out
+
+
+def _metrics():
+    """ЦП, ОЗУ, температура и частота видеоядра — без внешних зависимостей."""
+    result = {"cpu": _cpu_percent(), "ram": _mem_percent(), "temp": None,
+              "gpu_mhz": None, "volts": None, "load": None}
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as handle:
+            result["temp"] = round(int(handle.read().strip()) / 1000, 1)
+    except Exception:
+        pass
+    gpu = _vcgencmd("measure_clock", "v3d")
+    if gpu and gpu.isdigit():
+        result["gpu_mhz"] = round(int(gpu) / 1_000_000)
+    volts = _vcgencmd("measure_volts", "core")
+    if volts:
+        try:
+            result["volts"] = float(volts.rstrip("V"))
+        except ValueError:
+            pass
+    try:
+        result["load"] = round(os.getloadavg()[0], 2)
+    except Exception:
+        pass
+    return result
+
+
 PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -93,11 +164,37 @@ PAGE = """<!DOCTYPE html>
  label { font-size:13px; color:#8fa4bd; display:block; margin:10px 0 4px; }
  .field { flex:1; min-width:130px; }
  .ok { color:#7ee0a5; }
+ .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; }
+ .metric { background:#0f1520; border:1px solid #24303f; border-radius:9px;
+           padding:8px 9px; min-width:0; }
+ .mhead { display:flex; justify-content:space-between; align-items:baseline; gap:6px;
+          font-size:12px; color:#8fa4bd; }
+ .mhead span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+ .mhead b { font-size:15px; color:#e8f0fa; font-weight:600; white-space:nowrap; }
+ .spark { display:block; width:100%; height:40px; margin-top:4px; }
+ .spark polyline { fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
 </style>
 </head>
 <body>
 <h1>ЧайОК</h1>
 <div class="sub" id="sub">подключаюсь…</div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between;align-items:baseline">
+    <div class="status">Железо</div>
+    <div class="status" id="hw_extra">—</div>
+  </div>
+  <div class="grid">
+    <div class="metric"><div class="mhead"><span>ЦП</span><b id="m_cpu">—</b></div>
+      <svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none"><polyline id="p_cpu" points=""/></svg></div>
+    <div class="metric"><div class="mhead"><span>ОЗУ</span><b id="m_ram">—</b></div>
+      <svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none"><polyline id="p_ram" points=""/></svg></div>
+    <div class="metric"><div class="mhead"><span>Температура</span><b id="m_temp">—</b></div>
+      <svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none"><polyline id="p_temp" points=""/></svg></div>
+    <div class="metric"><div class="mhead"><span>Видеоядро</span><b id="m_gpu">—</b></div>
+      <svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none"><polyline id="p_gpu" points=""/></svg></div>
+  </div>
+</div>
 
 <div class="card">
   <div class="row" style="justify-content:space-between">
@@ -373,6 +470,54 @@ async function pollUpdate() {
 loadVoices().then(loadSettings);
 refresh();
 setInterval(refresh, 3000);
+
+const HW_LEN = 60;
+const HW = {cpu: [], ram: [], temp: [], gpu: []};
+const HW_RANGE = {cpu: [0, 100], ram: [0, 100], temp: [30, 85], gpu: [0, 700]};
+const HW_COLOR = {cpu: '#00b4ff', ram: '#7ee0a5', temp: '#ff8a5b', gpu: '#c084fc'};
+
+function hwPush(arr, value) {
+  arr.push(value);
+  if (arr.length > HW_LEN) arr.shift();
+}
+
+function hwDraw(key) {
+  const [lo, hi] = HW_RANGE[key];
+  const arr = HW[key];
+  const span = Math.max(arr.length - 1, 1);
+  const pts = arr.map((v, i) => {
+    const x = (100 * i) / span;
+    const k = Math.min(1, Math.max(0, (v - lo) / (hi - lo)));
+    return x.toFixed(1) + ',' + (32 - 30 * k).toFixed(1);
+  }).join(' ');
+  const line = document.getElementById('p_' + key);
+  line.setAttribute('points', pts);
+  line.setAttribute('stroke', HW_COLOR[key]);
+}
+
+async function pollHw() {
+  try {
+    const res = await fetch('/api/metrics', {headers: {'X-Token': token}});
+    if (!res.ok) return;
+    const m = await res.json();
+    hwPush(HW.cpu, m.cpu);
+    hwPush(HW.ram, m.ram);
+    hwPush(HW.temp, m.temp == null ? 30 : m.temp);
+    hwPush(HW.gpu, m.gpu_mhz == null ? 0 : m.gpu_mhz);
+    ['cpu', 'ram', 'temp', 'gpu'].forEach(hwDraw);
+    document.getElementById('m_cpu').textContent = m.cpu.toFixed(0) + '%';
+    document.getElementById('m_ram').textContent = m.ram.toFixed(0) + '%';
+    document.getElementById('m_temp').textContent = m.temp == null ? '—' : m.temp.toFixed(1) + '°';
+    document.getElementById('m_gpu').textContent = m.gpu_mhz == null ? '—' : m.gpu_mhz + ' МГц';
+    const parts = [];
+    if (m.load != null) parts.push('load ' + m.load);
+    if (m.volts != null) parts.push(m.volts.toFixed(3) + ' В');
+    document.getElementById('hw_extra').textContent = parts.join(' · ') || '—';
+  } catch (e) { /* панель могла уйти в перезапуск */ }
+}
+
+pollHw();
+setInterval(pollHw, 2000);
 </script>
 </body>
 </html>
@@ -414,6 +559,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._json(_status())
+            return
+        if path == "/api/metrics":
+            self._json(_metrics())
             return
         if path == "/api/config":
             self._json(config.as_dict())

@@ -38,6 +38,7 @@ except ImportError:
 
 import alarm
 import addition
+import calc
 import audio_guard
 import notifier
 import radio as radio_mod
@@ -165,6 +166,11 @@ font_text = load_font(24)
 font_small = load_font(18)
 font_tiny = load_font(14)
 font_button = load_font(16)
+font_idle_clock = load_font(150, bold=True)
+font_idle_date = load_font(30)
+font_idle_hint = load_font(18)
+
+IDLE_AFTER = float(config.get("screen", "idle_after", default=30))
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
@@ -695,6 +701,18 @@ def speak_piper(text):
     _speech_queue.put(text)
 
 
+def boot_status(text):
+    """Строка на загрузочном экране. Если Plymouth уже вышел — пишем причину в лог."""
+    try:
+        result = subprocess.run(["plymouth", "update", f"--status={text}"],
+                                capture_output=True, timeout=2)
+        if result.returncode != 0:
+            reason = result.stderr.decode(errors="ignore").strip()
+            print(f"[boot] не показать «{text}»: {reason}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[boot] не показать «{text}»: {exc}", file=sys.stderr)
+
+
 def speech_text(text):
     """Готовит текст для Piper: символы, на которых он запинается."""
 
@@ -709,6 +727,10 @@ def speech_text(text):
     text = re.sub(r"(\d)\s*\.\s*(\d)", r"\1,\2", text)        # 3.8 → 3,8
     text = re.sub(r"(?<![\w-])-\s*(\d)", r"минус \1", text)   # -4 → минус 4
     text = re.sub(r"(?<![\w-])\+\s*(\d)", r"плюс \1", text)
+    text = text.replace("×", " умножить на ")
+    text = text.replace("÷", " разделить на ")
+    text = text.replace("^", " в степени ")
+    text = text.replace("=", " равно ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -1133,6 +1155,10 @@ def process_command(command):
     if addition_response:
         return addition_response, None
 
+    calc_response = calc.process_calc_command(command)
+    if calc_response:
+        return calc_response, None
+
     if "редактор" in command or "скрипт" in command:
         threading.Thread(target=open_script_editor, daemon=True).start()
         return "Открываю редактор.", None
@@ -1155,6 +1181,7 @@ class VoiceEngine:
             print(f"Модель Vosk не найдена: {model_path}", file=sys.stderr)
             sys.exit(1)
         vosk.SetLogLevel(-1)
+        boot_status("Загружаю распознавание речи")
         self.model = vosk.Model(model_path)
         self.recognizer = vosk.KaldiRecognizer(self.model, AUDIO_RATE)
         self.running = True
@@ -1322,6 +1349,35 @@ def wrap_text(text, font, max_width):
     return lines
 
 
+SEASON_BACKGROUNDS = {
+    "winter": ("bg_winter.png", "bg_winter.jpg"),
+    "summer": ("bg_summer.png", "bg_summer.jpg"),
+}
+
+
+def season_background_path(today=None):
+    """Осень и зима — зимний фон, весна и лето — летний."""
+    month = (today or datetime.date.today()).month
+    key = "winter" if month in (9, 10, 11, 12, 1, 2) else "summer"
+    for name in SEASON_BACKGROUNDS[key]:
+        path = os.path.join(PROJECT_DIR, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_cover(path, size):
+    """Заполняет экран картинкой с обрезкой краёв — без растягивания."""
+    image = pygame.image.load(path).convert()
+    src_w, src_h = image.get_size()
+    dst_w, dst_h = size
+    scale = max(dst_w / src_w, dst_h / src_h)
+    image = pygame.transform.smoothscale(image, (round(src_w * scale), round(src_h * scale)))
+    width, height = image.get_size()
+    return image.subsurface(((width - dst_w) // 2, (height - dst_h) // 2,
+                             dst_w, dst_h)).copy()
+
+
 class ChayOKUI:
     def __init__(self):
         self.status = "Ready"
@@ -1336,6 +1392,43 @@ class ChayOKUI:
         self.alarm_stop_rect = None
         self.setup_buttons()
         self.voice = None
+        self.last_activity = time.time()
+        self.idle = False
+        self._idle_bg = None
+        self._idle_bg_path = None
+
+    def touch(self):
+        self.last_activity = time.time()
+        self.idle = False
+
+    def _draw_idle(self):
+        """Заставка: сезонный фон, крупные часы, дата, подсказка."""
+        path = season_background_path()
+        if path != self._idle_bg_path:
+            self._idle_bg_path = path
+            self._idle_bg = None
+            if path:
+                try:
+                    self._idle_bg = load_cover(path, (SCREEN_WIDTH, SCREEN_HEIGHT))
+                except Exception:
+                    self._idle_bg = None
+        if self._idle_bg:
+            screen.blit(self._idle_bg, (0, 0))
+        else:
+            screen.fill(COLORS["bg"])
+
+        veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        veil.fill((6, 10, 16, 135))
+        screen.blit(veil, (0, 0))
+
+        now = datetime.datetime.now()
+        clock = font_idle_clock.render(now.strftime("%H:%M"), True, COLORS["text"])
+        screen.blit(clock, clock.get_rect(center=(SCREEN_WIDTH // 2, 200)))
+        date_text = f"{WEEKDAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]}"
+        rendered = font_idle_date.render(date_text, True, COLORS["text_dim"])
+        screen.blit(rendered, rendered.get_rect(center=(SCREEN_WIDTH // 2, 292)))
+        hint = font_idle_hint.render("скажи «ЧайОК»", True, COLORS["primary"])
+        screen.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, 444)))
 
     def setup_buttons(self):
         btn_w, btn_h, spacing = 105, 45, 6
@@ -1421,6 +1514,10 @@ class ChayOKUI:
 
     def handle_click(self, pos):
         global is_generating
+        if self.idle:
+            self.touch()
+            self.update_display()
+            return True
         if self.timer_active and self.alarm_stop_rect and self.alarm_stop_rect.collidepoint(pos):
             timer_mod.stop()
             self.timer_active = False
@@ -1486,10 +1583,24 @@ class ChayOKUI:
     def update_status(self, status, subtext=""):
         self.status = status
         self.subtext = subtext
+        self.touch()
         self.update_display()
 
     def update_display(self):
         screen.fill(COLORS["bg"])
+
+        voice_busy = bool(self.voice and getattr(self.voice, "state", "waiting") != "waiting")
+        busy = (self.alarm_active or self.timer_active or radio_mod.player.active()
+                or voice_busy or audio_guard.audio_playing.is_set())
+        if busy:
+            self.last_activity = time.time()
+        was_idle = self.idle
+        self.idle = not busy and (time.time() - self.last_activity >= IDLE_AFTER)
+        if self.idle != was_idle:
+            print("[idle] заставка " + ("включена" if self.idle else "скрыта"), file=sys.stderr)
+        if self.idle:
+            self._draw_idle()
+            return
 
         # посимвольный вывод ответа
         now_ms = pygame.time.get_ticks()
@@ -1690,6 +1801,7 @@ def main():
     global ui, custom_commands, alarm_pending, followup_until, pending_followup
     install_crash_hook()
     install_signal_handlers()
+    boot_status("Запускаю интерфейс")
     os.makedirs(PROJECT_DIR, exist_ok=True)
     os.makedirs(os.path.join(PROJECT_DIR, "sounds"), exist_ok=True)
     custom_commands = load_custom_commands()
@@ -1714,6 +1826,7 @@ def main():
     voice = VoiceEngine(VOSK_MODEL_PATH)
     ui.voice = voice
     print("Микрофон готов")
+    boot_status("Готов к работе")
     ui.update_status("Ready", "Скажи 'ЧайОК' или нажми кнопку")
 
     running = True
