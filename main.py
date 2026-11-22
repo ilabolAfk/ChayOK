@@ -1418,17 +1418,21 @@ class ChayOKUI:
             screen.fill(COLORS["bg"])
 
         veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        veil.fill((6, 10, 16, 135))
+        veil.fill((6, 10, 16, 165))
         screen.blit(veil, (0, 0))
 
         now = datetime.datetime.now()
-        clock = font_idle_clock.render(now.strftime("%H:%M"), True, COLORS["text"])
-        screen.blit(clock, clock.get_rect(center=(SCREEN_WIDTH // 2, 200)))
-        date_text = f"{WEEKDAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]}"
-        rendered = font_idle_date.render(date_text, True, COLORS["text_dim"])
-        screen.blit(rendered, rendered.get_rect(center=(SCREEN_WIDTH // 2, 292)))
-        hint = font_idle_hint.render("скажи «ЧайОК»", True, COLORS["primary"])
-        screen.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, 444)))
+
+        def centered(text, font, color, y):
+            shadow = font.render(text, True, (4, 8, 12))
+            screen.blit(shadow, shadow.get_rect(center=(SCREEN_WIDTH // 2 + 2, y + 3)))
+            rendered = font.render(text, True, color)
+            screen.blit(rendered, rendered.get_rect(center=(SCREEN_WIDTH // 2, y)))
+
+        centered(now.strftime("%H:%M"), font_idle_clock, COLORS["text"], 200)
+        centered(f"{WEEKDAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]}",
+                 font_idle_date, COLORS["text"], 292)
+        centered("скажи «ЧайОК»", font_idle_hint, COLORS["primary"], 444)
 
     def setup_buttons(self):
         btn_w, btn_h, spacing = 105, 45, 6
@@ -1600,6 +1604,7 @@ class ChayOKUI:
             print("[idle] заставка " + ("включена" if self.idle else "скрыта"), file=sys.stderr)
         if self.idle:
             self._draw_idle()
+            pygame.display.flip()
             return
 
         # посимвольный вывод ответа
