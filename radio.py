@@ -159,6 +159,11 @@ class Radio:
         nxt = (self.index + 1) % len(self.stations)
         return self.start(nxt)
 
+    def prev_station(self):
+        if not self.stations:
+            return None
+        return self.start((self.index - 1) % len(self.stations))
+
     def set_volume(self, fraction):
         volume.save(fraction)
         self._apply_volume(fraction)

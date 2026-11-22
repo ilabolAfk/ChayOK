@@ -231,9 +231,9 @@ def draw_radio_waves(surface, rect, phase, energy=None):
     """Три бегущие синусоиды — волны вместо столбиков."""
     energy = volume.load() if energy is None else energy
     layers = (
-        (COLORS["primary"], 0.55, 1.0),
-        (COLORS["secondary"], 0.38, 1.6),
-        (COLORS["accent"], 0.26, 2.4),
+        ((255, 168, 64), 0.55, 1.0),
+        ((255, 104, 32), 0.38, 1.6),
+        ((255, 214, 130), 0.26, 2.4),
     )
     for color, amplitude_ratio, speed in layers:
         amplitude = rect.height * amplitude_ratio * (0.75 + 0.25 * energy)
@@ -424,13 +424,43 @@ def get_battery_level():
 # ========================================
 
 
+KEYBOARD_LAYOUTS = {
+    "ru": ("йцукенгшщзхъ", "фывапролджэ", "ячсмитьбюё"),
+    "en": ("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+}
+KEYBOARD_DIGITS = "1234567890-.,!?"
+KEY_BUTTON_COLOR = "#0078C8"   # как COLORS["button"] на экране устройства
+
+
+def round_keypad(parent, rows, callback, diameter=40, gap=6, width=780):
+    """Клавиши-кружки на canvas: у tkinter нет круглых кнопок."""
+    line_h = diameter + gap
+    canvas = tk.Canvas(parent, width=width, height=len(rows) * line_h,
+                       highlightthickness=0)
+    canvas.pack()
+    for row_index, row in enumerate(rows):
+        total = len(row) * (diameter + gap) - gap
+        x0 = int((width - total) / 2)
+        for col, label in enumerate(row):
+            x = x0 + col * (diameter + gap)
+            y = row_index * line_h
+            oval = canvas.create_oval(x, y, x + diameter, y + diameter,
+                                      fill=KEY_BUTTON_COLOR, outline="")
+            text = canvas.create_text(x + diameter / 2, y + diameter / 2, text=label,
+                                      fill="white", font=("DejaVu Sans", 13, "bold"))
+            for item in (oval, text):
+                canvas.tag_bind(item, "<Button-1>", lambda _e, l=label: callback(l))
+    return canvas
+
+
 def open_script_editor():
     if not HAS_TK:
         print("tkinter не установлен")
         return
 
     def save_script():
-        commands = [line.strip() for line in text_area.get("1.0", tk.END).strip().split("\n") if line.strip()]
+        commands = [line.strip() for line in text_area.get("1.0", tk.END).strip().split("\n")
+                    if line.strip()]
         save_custom_commands(commands)
         status_label.config(text="Сохранено!")
         root.after(1500, lambda: status_label.config(text=""))
@@ -438,21 +468,60 @@ def open_script_editor():
         custom_commands = load_custom_commands()
 
     root = tk.Tk()
-    root.title("Редактор скриптов ЧайОК")
-    root.geometry("600x400")
-    tk.Label(root, text="Введи команды (по одной на строку):", font=("DejaVu Sans", 12)).pack(pady=5)
-    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("DejaVu Sans Mono", 12))
-    text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    root.title("Редактор команд ЧайОК")
+    root.geometry("790x470+5+5")
+
+    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=8,
+                                          font=("DejaVu Sans Mono", 12))
+    text_area.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
     commands = load_custom_commands()
     text_area.insert("1.0", "\n".join(commands) if commands else "включи свет\nвыключи свет")
-    btn_frame = tk.Frame(root)
-    btn_frame.pack(pady=5)
-    tk.Button(btn_frame, text="Сохранить", command=save_script, bg="lightgreen",
-              font=("DejaVu Sans", 10)).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="Закрыть", command=root.destroy, bg="lightcoral",
-              font=("DejaVu Sans", 10)).pack(side=tk.LEFT, padx=5)
+
+    def insert(ch):
+        text_area.insert(tk.INSERT, ch)
+        text_area.see(tk.INSERT)
+
+    keyboard = tk.Frame(root)
+    keyboard.pack(pady=2)
+    state = {"layout": "ru"}
+
+    def press(label):
+        insert(label.lower() if len(label) == 1 else label)
+
+    def build_rows():
+        for child in keyboard.winfo_children():
+            child.destroy()
+        rows = [KEYBOARD_DIGITS] + [row.upper() for row in KEYBOARD_LAYOUTS[state["layout"]]]
+        round_keypad(keyboard, rows, press, diameter=40, gap=6)
+
+    def toggle_layout():
+        state["layout"] = "en" if state["layout"] == "ru" else "ru"
+        switch_btn.config(text="РУС" if state["layout"] == "en" else "ENG")
+        build_rows()
+
+    build_rows()
+
+    controls = tk.Frame(root)
+    controls.pack(fill=tk.X, padx=6, pady=4)
+    tk.Button(controls, text="Пробел", width=8, font=("DejaVu Sans", 10),
+              command=lambda: insert(" ")).pack(side=tk.LEFT, padx=2)
+    tk.Button(controls, text="⌫", width=3, font=("DejaVu Sans", 10),
+              command=lambda: text_area.delete("insert-1c")).pack(side=tk.LEFT, padx=2)
+    tk.Button(controls, text="⏎", width=3, font=("DejaVu Sans", 10),
+              command=lambda: insert("\n")).pack(side=tk.LEFT, padx=2)
+    tk.Button(controls, text="Очистить", width=8, font=("DejaVu Sans", 10),
+              command=lambda: text_area.delete("1.0", tk.END)).pack(side=tk.LEFT, padx=2)
+    switch_btn = tk.Button(controls, text="ENG", width=4, font=("DejaVu Sans", 10),
+                           command=toggle_layout)
+    switch_btn.pack(side=tk.LEFT, padx=2)
+
     status_label = tk.Label(root, text="", font=("DejaVu Sans", 10))
-    status_label.pack()
+    status_label.pack(side=tk.LEFT, padx=8)
+    tk.Button(root, text="Закрыть", font=("DejaVu Sans", 10), bg="lightcoral",
+              command=root.destroy).pack(side=tk.RIGHT, padx=8)
+    tk.Button(root, text="Сохранить", font=("DejaVu Sans", 10), bg="lightgreen",
+              command=save_script).pack(side=tk.RIGHT, padx=4)
+
     root.mainloop()
 
 
@@ -461,46 +530,81 @@ def open_alarm_editor():
         print("tkinter не установлен")
         return
 
+    root = tk.Tk()
+    root.title("Будильник ЧайОК")
+    root.geometry("660x470+5+5")
+    current = alarm.load_alarm()
+    hour_var = tk.StringVar(value=f"{int(current.get('hour', 7)):02d}")
+    minute_var = tk.StringVar(value=f"{int(current.get('minute', 0)):02d}")
+    level_var = tk.StringVar(value=current.get("level", "средний"))
+    active = {"field": "hour"}
+
+    tk.Label(root, text="Настройка будильника",
+             font=("DejaVu Sans", 14, "bold")).pack(pady=6)
+
+    fields = tk.Frame(root)
+    fields.pack(pady=2)
+    hour_label = tk.Label(fields, text=hour_var.get(), font=("DejaVu Sans", 26, "bold"),
+                          width=3, fg="white")
+    hour_label.pack(side=tk.LEFT, padx=8)
+    tk.Label(fields, text=":", font=("DejaVu Sans", 26, "bold")).pack(side=tk.LEFT)
+    minute_label = tk.Label(fields, text=minute_var.get(), font=("DejaVu Sans", 26, "bold"),
+                            width=3, fg="white")
+    minute_label.pack(side=tk.LEFT, padx=8)
+
+    def paint_fields():
+        for name, label in (("hour", hour_label), ("minute", minute_label)):
+            label.config(bg=KEY_BUTTON_COLOR if active["field"] == name else "#3a3a3a")
+
+    def focus_field(name):
+        active["field"] = name
+        paint_fields()
+
+    hour_label.bind("<Button-1>", lambda _e: focus_field("hour"))
+    minute_label.bind("<Button-1>", lambda _e: focus_field("minute"))
+    paint_fields()
+
+    levels = tk.Frame(root)
+    levels.pack(pady=6)
+    for lvl in ("мягкий", "средний", "жёсткий"):
+        tk.Radiobutton(levels, text=lvl.capitalize(), variable=level_var, value=lvl,
+                       font=("DejaVu Sans", 11)).pack(side=tk.LEFT, padx=6)
+
+    def press(label):
+        var = hour_var if active["field"] == "hour" else minute_var
+        digits = var.get()
+        if label == "←":
+            digits = digits[:-1]
+        else:
+            if digits == "00":
+                digits = ""
+            if len(digits) < 2:
+                digits += label
+        var.set(digits)
+        (hour_label if active["field"] == "hour" else minute_label).config(text=digits)
+
+    round_keypad(root, ["12345", "67890", "←"], press, diameter=56, gap=10, width=640)
+
     def save_alarm_settings():
         try:
-            hour, minute = int(hour_var.get()), int(minute_var.get())
-            level = level_var.get()
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                status_label.config(text="Некорректное время!")
-                return
-            alarm.save_alarm(hour, minute, level, enabled=True)
-            status_label.config(text=f"Будильник: {hour:02d}:{minute:02d}, {level}")
-            root.after(2000, lambda: status_label.config(text=""))
+            hour, minute = int(hour_var.get() or 0), int(minute_var.get() or 0)
         except ValueError:
-            status_label.config(text="Введи числа!")
+            status_label.config(text="Нужны цифры")
+            return
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            status_label.config(text="Некорректное время!")
+            return
+        alarm.save_alarm(hour, minute, level_var.get(), enabled=True)
+        status_label.config(text=f"Будильник: {hour:02d}:{minute:02d}, {level_var.get()}")
+        root.after(2000, lambda: status_label.config(text=""))
 
     def disable_alarm():
         a = alarm.load_alarm()
         alarm.save_alarm(a["hour"], a["minute"], a.get("level", "средний"), enabled=False)
         status_label.config(text="Будильник отключён")
 
-    root = tk.Tk()
-    root.title("Будильник ЧайОК")
-    root.geometry("400x320")
-    current = alarm.load_alarm()
-    tk.Label(root, text="Настройка будильника", font=("DejaVu Sans", 14, "bold")).pack(pady=10)
-    time_frame = tk.Frame(root)
-    time_frame.pack(pady=5)
-    tk.Label(time_frame, text="Часы:").pack(side=tk.LEFT, padx=5)
-    hour_var = tk.StringVar(value=str(current.get("hour", 7)))
-    tk.Entry(time_frame, textvariable=hour_var, width=5).pack(side=tk.LEFT)
-    tk.Label(time_frame, text="Минуты:").pack(side=tk.LEFT, padx=5)
-    minute_var = tk.StringVar(value=str(current.get("minute", 0)))
-    tk.Entry(time_frame, textvariable=minute_var, width=5).pack(side=tk.LEFT)
-    level_frame = tk.Frame(root)
-    level_frame.pack(pady=15)
-    tk.Label(level_frame, text="Уровень жёсткости:", font=("DejaVu Sans", 12)).pack()
-    level_var = tk.StringVar(value=current.get("level", "средний"))
-    for lvl in ["мягкий", "средний", "жёсткий"]:
-        tk.Radiobutton(level_frame, text=lvl.capitalize(), variable=level_var,
-                       value=lvl, font=("DejaVu Sans", 11)).pack(anchor="w", padx=20)
     btn_frame = tk.Frame(root)
-    btn_frame.pack(pady=15)
+    btn_frame.pack(pady=8)
     tk.Button(btn_frame, text="Сохранить", command=save_alarm_settings, bg="lightgreen",
               font=("DejaVu Sans", 11), width=12).pack(side=tk.LEFT, padx=5)
     tk.Button(btn_frame, text="Отключить", command=disable_alarm, bg="lightyellow",
@@ -1349,32 +1453,35 @@ def wrap_text(text, font, max_width):
     return lines
 
 
-SEASON_BACKGROUNDS = {
-    "winter": ("bg_winter.png", "bg_winter.jpg"),
-    "summer": ("bg_summer.png", "bg_summer.jpg"),
-}
+SCREEN_BACKGROUNDS = {"main": 0, "radio": 120, "idle": 165}
+SCREEN_BRIGHTNESS = {"main": 34}
+# (zoom, anchor_y): 1.55 и низ картинки поднимают волну над карточкой со станцией
+SCREEN_CROP = {"radio": (1.55, 1.0)}
 
 
-def season_background_path(today=None):
-    """Осень и зима — зимний фон, весна и лето — летний."""
-    month = (today or datetime.date.today()).month
-    key = "winter" if month in (9, 10, 11, 12, 1, 2) else "summer"
-    for name in SEASON_BACKGROUNDS[key]:
-        path = os.path.join(PROJECT_DIR, name)
-        if os.path.exists(path):
-            return path
+def screen_background(kind):
+    """Фон под экран: bg_<kind>_<season> → bg_<kind> → bg_<season>."""
+    month = datetime.date.today().month
+    season = "winter" if month in (9, 10, 11, 12, 1, 2) else "summer"
+    for stem in (f"bg_{kind}_{season}", f"bg_{kind}", f"bg_{season}"):
+        for ext in (".jpg", ".png"):
+            path = os.path.join(PROJECT_DIR, stem + ext)
+            if os.path.exists(path):
+                return path
     return None
 
 
-def load_cover(path, size):
+def load_cover(path, size, zoom=1.0, anchor_y=0.5):
     """Заполняет экран картинкой с обрезкой краёв — без растягивания."""
     image = pygame.image.load(path).convert()
     src_w, src_h = image.get_size()
     dst_w, dst_h = size
-    scale = max(dst_w / src_w, dst_h / src_h)
-    image = pygame.transform.smoothscale(image, (round(src_w * scale), round(src_h * scale)))
+    scale = max(dst_w / src_w, dst_h / src_h) * zoom
+    image = pygame.transform.smoothscale(
+        image, (max(dst_w, round(src_w * scale)), max(dst_h, round(src_h * scale))))
     width, height = image.get_size()
-    return image.subsurface(((width - dst_w) // 2, (height - dst_h) // 2,
+    # anchor_y: 0 — верх картинки, 1 — низ; так волну радио можно поднять выше
+    return image.subsurface(((width - dst_w) // 2, int((height - dst_h) * anchor_y),
                              dst_w, dst_h)).copy()
 
 
@@ -1394,32 +1501,77 @@ class ChayOKUI:
         self.voice = None
         self.last_activity = time.time()
         self.idle = False
-        self._idle_bg = None
-        self._idle_bg_path = None
+        self._bg_cache = {}
 
     def touch(self):
         self.last_activity = time.time()
         self.idle = False
 
-    def _draw_idle(self):
-        """Заставка: сезонный фон, крупные часы, дата, подсказка."""
-        path = season_background_path()
-        if path != self._idle_bg_path:
-            self._idle_bg_path = path
-            self._idle_bg = None
+    def _paint_bg(self, kind):
+        """Кладёт затемнённый фон экрана. Готовый кадр кэшируется."""
+        alpha = SCREEN_BACKGROUNDS.get(kind, 150)
+        path = screen_background(kind)
+        key = (path, alpha)
+        background = self._bg_cache.get(key)
+        if background is None:
+            background = False
             if path:
                 try:
-                    self._idle_bg = load_cover(path, (SCREEN_WIDTH, SCREEN_HEIGHT))
-                except Exception:
-                    self._idle_bg = None
-        if self._idle_bg:
-            screen.blit(self._idle_bg, (0, 0))
+                    zoom, anchor = SCREEN_CROP.get(kind, (1.0, 0.5))
+                    image = load_cover(path, (SCREEN_WIDTH, SCREEN_HEIGHT), zoom, anchor)
+                    bright = SCREEN_BRIGHTNESS.get(kind)
+                    if bright:
+                        image.fill((bright, bright, bright), special_flags=pygame.BLEND_RGB_ADD)
+                    if alpha:
+                        veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                        veil.fill((6, 10, 14, alpha))
+                        image.blit(veil, (0, 0))
+                    background = image
+                except Exception as exc:
+                    print(f"[bg] не загрузить {path}: {exc}", file=sys.stderr)
+            self._bg_cache[key] = background
+        if background:
+            screen.blit(background, (0, 0))
         else:
             screen.fill(COLORS["bg"])
 
-        veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        veil.fill((6, 10, 16, 165))
-        screen.blit(veil, (0, 0))
+    def _player_rects(self):
+        y = 366
+        centers = {"prev": SCREEN_WIDTH // 2 - 110, "stop": SCREEN_WIDTH // 2,
+                   "next": SCREEN_WIDTH // 2 + 110}
+        return {key: pygame.Rect(cx - 34, y, 68, 68) for key, cx in centers.items()}
+
+    def _draw_player(self):
+        """Круглые кнопки плеера: назад, стоп, вперёд."""
+        mouse = pygame.mouse.get_pos()
+        self.player_rects = self._player_rects()
+        for key, rect in self.player_rects.items():
+            color = COLORS["button_hover"] if rect.collidepoint(mouse) else COLORS["button"]
+            pygame.draw.circle(screen, color, rect.center, 32)
+            cx, cy = rect.center
+            if key == "stop":
+                pygame.draw.rect(screen, (255, 255, 255), pygame.Rect(cx - 10, cy - 10, 20, 20))
+            else:
+                direction = -1 if key == "prev" else 1
+                for offset in (-11, 1):
+                    tip = cx + direction * (offset + 10)
+                    pygame.draw.polygon(screen, (255, 255, 255), [
+                        (cx + direction * offset, cy - 12),
+                        (cx + direction * offset, cy + 12),
+                        (tip, cy),
+                    ])
+
+    def _card(self, rect, border):
+        """Полупрозрачная карточка — фон просвечивает."""
+        surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+        draw_rounded_rect(surface, (*COLORS["card_bg"], 200),
+                          pygame.Rect(0, 0, rect.width, rect.height), radius=8)
+        screen.blit(surface, rect.topleft)
+        pygame.draw.rect(screen, border, rect, 1, border_radius=8)
+
+    def _draw_idle(self):
+        """Заставка: сезонный фон, крупные часы, дата, подсказка."""
+        self._paint_bg("idle")
 
         now = datetime.datetime.now()
 
@@ -1522,6 +1674,19 @@ class ChayOKUI:
             self.touch()
             self.update_display()
             return True
+        if radio_mod.player.active():
+            rects = getattr(self, "player_rects", None) or self._player_rects()
+            if rects["stop"].collidepoint(pos):
+                self.response = radio_mod.player.stop()
+                self.update_display()
+                return True
+            for key, action in (("prev", radio_mod.player.prev_station),
+                                ("next", radio_mod.player.next_station)):
+                if rects[key].collidepoint(pos):
+                    name = action()
+                    self.response = f"Радио: {name}" if name else "Не вышло переключить"
+                    self.update_display()
+                    return True
         if self.timer_active and self.alarm_stop_rect and self.alarm_stop_rect.collidepoint(pos):
             timer_mod.stop()
             self.timer_active = False
@@ -1591,8 +1756,6 @@ class ChayOKUI:
         self.update_display()
 
     def update_display(self):
-        screen.fill(COLORS["bg"])
-
         voice_busy = bool(self.voice and getattr(self.voice, "state", "waiting") != "waiting")
         busy = (self.alarm_active or self.timer_active or radio_mod.player.active()
                 or voice_busy or audio_guard.audio_playing.is_set())
@@ -1607,6 +1770,8 @@ class ChayOKUI:
             pygame.display.flip()
             return
 
+        self._paint_bg("radio" if radio_mod.player.active() else "main")
+
         # посимвольный вывод ответа
         now_ms = pygame.time.get_ticks()
         delta = min(0.25, max(0.0, (now_ms - self._last_tick) / 1000.0))
@@ -1618,10 +1783,6 @@ class ChayOKUI:
             self.reveal = len(full_text)
         visible_text = full_text[:int(self.reveal)]
 
-        logo = get_logo()
-        if logo:
-            screen.blit(logo, (SCREEN_WIDTH - 70, SCREEN_HEIGHT - 70))
-
         now = datetime.datetime.now()
         clock = font_clock.render(now.strftime("%H:%M"), True, COLORS["primary"])
         screen.blit(clock, (SCREEN_WIDTH - 30 - clock.get_width(), 6))
@@ -1629,8 +1790,6 @@ class ChayOKUI:
         rendered_date = font_tiny.render(date_text, True, COLORS["text_dim"])
         screen.blit(rendered_date, (SCREEN_WIDTH - 30 - rendered_date.get_width(), 54))
 
-        draw_glow_line(screen, COLORS["primary"], (30, 80), (SCREEN_WIDTH - 30, 80), 2)
-        draw_glow_line(screen, COLORS["secondary"], (30, 85), (SCREEN_WIDTH - 30, 85), 1)
         screen.blit(font_title.render("[ ChayOK ]", True, COLORS["primary"]), (30, 12))
         if "Ready" in self.status:
             status_col = COLORS["salad"]
@@ -1662,9 +1821,7 @@ class ChayOKUI:
 
         if full_text:
             card = pygame.Rect(30, 150, card_w, 198)
-            draw_rounded_rect(screen, COLORS["card_bg"], card, radius=8)
-            # только контур: draw_rounded_rect всегда заливает цветом
-            pygame.draw.rect(screen, COLORS["border"], card, 1, border_radius=8)
+            self._card(card, COLORS["border"])
             lines = wrap_text(visible_text, font_text, card_w - 40)
             y = 168
             max_lines = (card.height - 36) // 30
@@ -1684,25 +1841,27 @@ class ChayOKUI:
         if self.weather_data and "Ошибка" not in self.weather_data:
             wx, wy = SCREEN_WIDTH - 280, 150
             panel = pygame.Rect(wx, wy, 250, 190)
-            draw_rounded_rect(screen, COLORS["card_bg"], panel, radius=8)
-            pygame.draw.rect(screen, COLORS["secondary"], panel, 1, border_radius=8)
+            self._card(panel, COLORS["secondary"])
 
             icon_kind = weather_icon_kind(self.weather_data.get("_code", 3))
             draw_weather_icon(screen, icon_kind, pygame.Rect(wx + 10, wy + 10, 64, 64))
 
-            header = font_tiny.render(str(self.weather_data.get("Погода", "")).capitalize(),
-                                      True, COLORS["text"])
-            screen.blit(header, (wx + 84, wy + 36))
+            # описание переносится по словам: "Небольшие снежные ливни" не влезает в строку
+            header_lines = wrap_text(str(self.weather_data.get("Погода", "")).capitalize(),
+                                     font_tiny, 148)[:3]
+            text_y = wy + 12
+            for line in header_lines:
+                screen.blit(font_tiny.render(line, True, COLORS["text"]), (wx + 84, text_y))
+                text_y += 22
 
-            y_offset = wy + 80
+            y_offset = max(wy + 80, text_y + 6)
             rows = [(k, v) for k, v in self.weather_data.items()
                     if not k.startswith("_") and k != "Погода"]
             for key, value in rows[:4]:
-                screen.blit(font_tiny.render(f"{key}: {value}", True, COLORS["text"]),
-                            (wx + 12, y_offset))
-                y_offset += 26
+                for line in wrap_text(f"{key}: {value}", font_tiny, panel.width - 24)[:2]:
+                    screen.blit(font_tiny.render(line, True, COLORS["text"]), (wx + 12, y_offset))
+                    y_offset += 22
 
-        draw_glow_line(screen, COLORS["primary"], (30, 416), (SCREEN_WIDTH - 30, 416), 1)
         if self.subtext:
             screen.blit(font_small.render(self.subtext, True, COLORS["text_dim"]), (30, 432))
         bat_level = get_battery_level()
@@ -1714,13 +1873,16 @@ class ChayOKUI:
             bat_text = font_small.render("Battery: --%", True, COLORS["text_dim"])
         # справа, чтобы не наезжать на подпись и логотип
         screen.blit(bat_text, (SCREEN_WIDTH - 240, 432))
-        if self.show_buttons:
+        if self.show_buttons and not radio_mod.player.active():
             mouse_pos = pygame.mouse.get_pos()
             for btn in self.buttons:
                 color = COLORS["button_hover"] if btn["rect"].collidepoint(mouse_pos) else COLORS["button"]
                 draw_rounded_rect(screen, color, btn["rect"], radius=8)
                 btn_text = font_button.render(btn["label"], True, (255, 255, 255))
                 screen.blit(btn_text, btn_text.get_rect(center=btn["rect"].center))
+
+        if self.show_buttons and radio_mod.player.active():
+            self._draw_player()
 
         if holiday_mode():
             draw_garland(screen, now_ms / 1000.0)
