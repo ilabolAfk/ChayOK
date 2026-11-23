@@ -26,7 +26,7 @@ DEFAULT = {
             "Отвечай по-русски, кратко: одно-два предложения, без списков и разметки. "
             "Никогда не пиши даты в формате ГГГГ-ММ-ДД — называй дату словами."
         ),
-        "history_limit": 4,
+        "history_limit": 2,
         "timeout_connect": 5,
         "timeout_read": 180,
         "providers": [
@@ -34,7 +34,7 @@ DEFAULT = {
                 "kind": "completion",
                 "url": "http://127.0.0.1:8080/completion",
                 "name": "Bonsai (Pi, llama.cpp)",
-                "max_tokens": 160,
+                "max_tokens": 70,
             },
             {
                 "kind": "ollama",

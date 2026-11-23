@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,7 @@ except ImportError:
 import alarm
 import addition
 import calc
+import quick
 import audio_guard
 import notifier
 import radio as radio_mod
@@ -1262,6 +1264,10 @@ def process_command(command):
     calc_response = calc.process_calc_command(command)
     if calc_response:
         return calc_response, None
+
+    quick_response = quick.process_quick_command(command)
+    if quick_response:
+        return quick_response, None
 
     if "редактор" in command or "скрипт" in command:
         threading.Thread(target=open_script_editor, daemon=True).start()
