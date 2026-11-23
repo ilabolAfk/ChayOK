@@ -5,6 +5,7 @@
 """
 
 import datetime
+import glob
 import json
 import math
 import os
@@ -55,6 +56,12 @@ import webpanel
 # ========================================
 
 WAKE_WORDS = config.get("voice_input", "wake_words", default=["чайок"])
+# Vosk слышит «ЧайОК» по-разному: «чи йоко», «чай о», «чаёк». Сравниваем без пробелов.
+WAKE_COMPACT = [word.replace(" ", "").replace("ё", "е") for word in WAKE_WORDS]
+WAKE_COMPACT += ["йоко", "йок", "чайко", "чийок"]
+VOICE_REPLACEMENTS = config.get("voice", "replace", default={})
+PROTEIN_HINTS = ("аминокислот", "полимер", "клетк", "мышц", "хрящ",
+                 "углевод", "нуклеин", "фермент", "протеин")
 COMMAND_SILENCE = float(config.get("voice_input", "command_silence", default=2.5))
 HISTORY_LIMIT = int(config.get("llm", "history_limit", default=4))
 FOLLOWUP_SECONDS = float(config.get("voice_input", "followup_seconds", default=5))
@@ -81,18 +88,67 @@ LLM_PROVIDERS = config.get("llm", "providers", default=[{
 LLM_TIMEOUT = (int(config.get("llm", "timeout_connect", default=5)),
                int(config.get("llm", "timeout_read", default=180)))
 LLM_SYSTEM_PROMPT = config.get("llm", "system_prompt", default="Ты — ЧайОК.")
+MAX_SENTENCES = max(1, int(config.get("llm", "max_sentences", default=2)))
 
 CITY = config.get("weather", "city", default="Москва")
 
 AUDIO_RATE = int(config.get("audio", "rate", default=16000))   # Vosk обучен на 16 кГц
 AUDIO_CHANNELS = int(config.get("audio", "channels", default=1))
 AUDIO_CHUNK = int(config.get("audio", "chunk", default=4000))
+MIC_GAIN = float(config.get("audio", "gain", default=1.0))
+AGC_TARGET = float(config.get("audio", "agc_target", default=20000))
+AGC_MAX = float(config.get("audio", "agc_max", default=6.0))
+NOISE_GATE = int(config.get("audio", "noise_gate", default=200))
+MIC_DEBUG_FLAG = "/tmp/chayok_micdebug"
 
 MIC_DEVICE = os.environ.get("CHAYOK_MIC") or config.get("audio", "mic_device", default="")
 SPK_DEVICE = os.environ.get("CHAYOK_SPK") or config.get("audio", "spk_device", default="")
 
 SCREEN_WIDTH = int(config.get("screen", "width", default=800))
 SCREEN_HEIGHT = int(config.get("screen", "height", default=480))
+SCREEN_OFF_AFTER = float(config.get("screen", "off_after", default=180))
+DIM_LEVEL = int(config.get("screen", "dim_level", default=25))
+
+
+def _find_backlight():
+    for path in glob.glob("/sys/class/backlight/*/brightness"):
+        return path
+    return None
+
+
+BRIGHTNESS_FILE = _find_backlight()
+
+
+def _read_brightness(fallback=0):
+    if not BRIGHTNESS_FILE:
+        return fallback
+    try:
+        with open(BRIGHTNESS_FILE) as handle:
+            return int(handle.read().strip())
+    except Exception:
+        return fallback
+
+
+def _max_brightness(fallback=255):
+    """Полная яркость панели — а не та, что осталась от притухания."""
+    if not BRIGHTNESS_FILE:
+        return fallback
+    try:
+        with open(BRIGHTNESS_FILE.replace("brightness", "max_brightness")) as handle:
+            return int(handle.read().strip())
+    except Exception:
+        return fallback
+
+
+def set_backlight(value):
+    """Меняет яркость DSI-панели: 0 — темно, max_brightness — полная."""
+    if not BRIGHTNESS_FILE:
+        return
+    try:
+        with open(BRIGHTNESS_FILE, "w") as handle:
+            handle.write(str(int(value)))
+    except Exception as exc:
+        print(f"[backlight] {exc}", file=sys.stderr)
 
 alarm_pending = None
 is_generating = False
@@ -826,6 +882,18 @@ def speech_text(text):
         value = int(match.group(1))
         return f"{value} {_plural(value, 'процент', 'процента', 'процентов')}"
 
+    # ударения и произношение: {"замок": "замо́к"} в config.json → voice.replace
+    for word, replacement in VOICE_REPLACEMENTS.items():
+        text = re.sub(rf"(?<![а-яёa-z]){re.escape(word)}(?![а-яёa-z])",
+                      replacement, text, flags=re.IGNORECASE)
+
+    # бе́лки-животные и белки́-полимеры: Piper всегда читает «бЕлки»,
+    # в научном контексте ставим ударение сами
+    lowered = text.lower()
+    if "белки" in lowered and any(hint in lowered for hint in PROTEIN_HINTS):
+        text = re.sub(r"(?<![а-яёa-z])белки(?![а-яёa-z])", "белки́", text,
+                      flags=re.IGNORECASE)
+
     text = text.replace("м/с", "метров в секунду")
     text = text.replace("км/ч", "километров в час")
     text = re.sub(r"(\d+)\s*%", percent_to_words, text)
@@ -884,6 +952,9 @@ threading.Thread(target=_speech_worker, daemon=True).start()
 # ========================================
 
 
+LLM_HIT_LIMIT = {"value": False}
+
+
 def _iter_tokens(response, kind):
     """Отдаёт текстовые куски из SSE (llama.cpp) или NDJSON (ollama)."""
     for raw in response.iter_lines():
@@ -902,6 +973,9 @@ def _iter_tokens(response, kind):
             continue
         if "error" in chunk:
             raise RuntimeError(str(chunk["error"])[:200])
+        # модель упёрлась в лимит токенов — ответ оборван
+        if chunk.get("stopped_limit") or chunk.get("done_reason") == "length":
+            LLM_HIT_LIMIT["value"] = True
         if kind == "completion":
             piece = chunk.get("content") or ""
         elif kind == "openai":
@@ -993,9 +1067,43 @@ def _build_payload(provider, messages):
     }
 
 
+def _cut_sentences(text, limit=None):
+    """Обрезает текст после N законченных предложений: (текст, хватит_ли)."""
+    limit = MAX_SENTENCES if limit is None else limit
+    finished = re.findall(r"[^.!?…]+[.!?…]+", text)
+    if len(finished) >= limit:
+        return "".join(finished[:limit]).strip(), True
+    return text, False
+
+
+def warm_up_llm():
+    """Прогревает кэш префикса: первый настоящий вопрос не ждёт обработки промпта.
+
+    Замерено на Pi: без прогрева первый ответ ждёт 8–40 с, с прогрева — 0,7 с.
+    """
+    if not LLM_PROVIDERS:
+        return
+    provider = LLM_PROVIDERS[0]
+    payload = _build_payload(provider, [{"role": "system", "content": LLM_SYSTEM_PROMPT},
+                                        {"role": "user", "content": "привет"}])
+    payload.pop("stream", None)
+    if provider.get("kind") == "completion":
+        payload["n_predict"] = 1
+    else:
+        payload["max_tokens"] = 1
+        payload.get("options", {}).pop("num_predict", None)
+    started = time.time()
+    try:
+        requests.post(provider["url"], json=payload, timeout=120)
+        print(f"[LLM] прогрев за {time.time() - started:.1f} с", file=sys.stderr)
+    except Exception as exc:
+        print(f"[LLM] прогрев не удался: {exc}", file=sys.stderr)
+
+
 def ask_llm_streaming(command, ui_ref):
     global is_generating, pending_followup
     is_generating = True
+    LLM_HIT_LIMIT["value"] = False
     ui_ref.status = "Generating..."
     dialogue_history.append({"role": "user", "content": command})
     messages = ([{"role": "system", "content": LLM_SYSTEM_PROMPT}]
@@ -1018,6 +1126,7 @@ def ask_llm_streaming(command, ui_ref):
                 continue
 
             print(f"[LLM] {provider['name']}")
+            enough = False
             try:
                 for piece in _strip_think(_iter_tokens(r, kind)):
                     full_text += piece
@@ -1031,8 +1140,18 @@ def ask_llm_streaming(command, ui_ref):
                             break
                         speak_piper(match.group(0).strip())
                         sentence_buffer = sentence_buffer[match.end():].lstrip()
+                    # модель любит растекаться: после N предложений рвём поток
+                    cut, enough = _cut_sentences(full_text)
+                    if enough:
+                        full_text = cut
+                        ui_ref.response = cut
+                        sentence_buffer = ""
+                        break
             finally:
                 r.close()
+
+            if enough:
+                break
 
             if full_text.strip():
                 break
@@ -1041,6 +1160,11 @@ def ask_llm_streaming(command, ui_ref):
         if sentence_buffer.strip():
             speak_piper(sentence_buffer.strip())
         answer = full_text.strip()
+        if LLM_HIT_LIMIT["value"] and answer and answer[-1] not in ".!?…":
+            trimmed = re.sub(r"\s+\S*$", "", answer)
+            if trimmed:
+                answer = trimmed
+                ui_ref.response = answer
         if answer:
             dialogue_history.append({"role": "assistant", "content": answer})
             del dialogue_history[:-HISTORY_LIMIT * 2]
@@ -1302,6 +1426,8 @@ class VoiceEngine:
         self.process = None
         self._muted = False
         self.level = 0.0          # уровень микрофона 0..1 для индикатора
+        self._debug_ts = 0.0
+        self._debug_peak = 0
         self._start_arecord()
         threading.Thread(target=self._listen_loop, daemon=True).start()
 
@@ -1314,7 +1440,40 @@ class VoiceEngine:
         print(f"Микрофон: {device}")
 
     def _is_wake_word(self, text):
-        return any(w in text for w in WAKE_WORDS)
+        compact = text.replace(" ", "").replace("ё", "е")
+        return any(word in compact for word in WAKE_COMPACT)
+
+    @staticmethod
+    def _amplify(data):
+        """Автоусиление: тихую речь тянем к пиковому AGC_TARGET, шум не трогаем."""
+        samples = array("h", data)
+        if not samples:
+            return data
+        peak = max(max(samples), -min(samples))
+        if peak < NOISE_GATE:
+            return data
+        gain = min(AGC_MAX, AGC_TARGET / peak)
+        if gain <= MIC_GAIN:
+            return data
+        boosted = array("h", (max(-32768, min(32767, int(value * gain)))
+                              for value in samples))
+        return boosted.tobytes()
+
+    def _debug_mic(self, data):
+        """Раз в секунду пишет уровень в журнал, если включён флаг."""
+        if not os.path.exists(MIC_DEBUG_FLAG):
+            return
+        samples = array("h", data)
+        if not samples:
+            return
+        self._debug_peak = max(self._debug_peak, max(max(samples), -min(samples)))
+        now = time.time()
+        if now - self._debug_ts < 1.0:
+            return
+        rms = (sum(value * value for value in samples[::2]) / max(1, len(samples[::2]))) ** 0.5
+        print(f"[mic] rms={rms:.0f} peak={self._debug_peak}", file=sys.stderr)
+        self._debug_ts = now
+        self._debug_peak = 0
 
     @staticmethod
     def _rms(data):
@@ -1355,6 +1514,8 @@ class VoiceEngine:
                 continue
 
             self.level = self.level * 0.6 + self._rms(data) * 0.4
+            self._debug_mic(data)
+            data = self._amplify(data)
 
             # поток читаем всегда (иначе ALSA захлёбывается), но пока говорим
             # сами — кадры в распознавание не отдаём
@@ -1374,6 +1535,8 @@ class VoiceEngine:
             if self.recognizer.AcceptWaveform(data):
                 res = json.loads(self.recognizer.Result())
                 text = res.get("text", "").lower()
+                if text and os.path.exists(MIC_DEBUG_FLAG):
+                    print(f"[mic] финал: {text}", file=sys.stderr)
                 if self.state == "waiting":
                     if self._is_wake_word(text) or self._in_followup(text):
                         self._start_listening()
@@ -1508,6 +1671,9 @@ class ChayOKUI:
         self.last_activity = time.time()
         self.idle = False
         self._bg_cache = {}
+        self._screen_on = True
+        self._brightness_saved = _max_brightness()
+        set_backlight(self._brightness_saved)  # выйти из притухания прошлого запуска
 
     def touch(self):
         self.last_activity = time.time()
@@ -1764,7 +1930,7 @@ class ChayOKUI:
     def update_display(self):
         voice_busy = bool(self.voice and getattr(self.voice, "state", "waiting") != "waiting")
         busy = (self.alarm_active or self.timer_active or radio_mod.player.active()
-                or voice_busy or audio_guard.audio_playing.is_set())
+                or voice_busy or audio_guard.audio_playing.is_set() or is_generating)
         if busy:
             self.last_activity = time.time()
         was_idle = self.idle
@@ -1772,9 +1938,19 @@ class ChayOKUI:
         if self.idle != was_idle:
             print("[idle] заставка " + ("включена" if self.idle else "скрыта"), file=sys.stderr)
         if self.idle:
+            if time.time() - self.last_activity >= SCREEN_OFF_AFTER:
+                if self._screen_on:
+                    set_backlight(DIM_LEVEL)
+                    self._screen_on = False
+                    print(f"[idle] экран притушен до {DIM_LEVEL}", file=sys.stderr)
             self._draw_idle()
             pygame.display.flip()
             return
+
+        if not self._screen_on:
+            set_backlight(self._brightness_saved)
+            self._screen_on = True
+            print("[idle] экран включён", file=sys.stderr)
 
         self._paint_bg("radio" if radio_mod.player.active() else "main")
 
@@ -2001,6 +2177,7 @@ def main():
     print("Микрофон готов")
     boot_status("Готов к работе")
     ui.update_status("Ready", "Скажи 'ЧайОК' или нажми кнопку")
+    threading.Thread(target=warm_up_llm, daemon=True).start()
 
     running = True
     try:
